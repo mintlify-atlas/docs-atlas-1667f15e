@@ -137,7 +137,7 @@ CEL validation rule: exactly **one** of `port` or `namedPort` must be present pe
 
 ## spec.cidrRules[]
 
-`cidrRules` is an optional list (max **256 items**) of CIDR-based rules for external IP ranges such as on-premises databases, external APIs, or monitoring infrastructure.
+`cidrRules` is an optional list (max **256 items**) of CIDR-based rules for external IP ranges such as on-premises databases, external APIs, or monitoring infrastructure. Each rule controls traffic to or from a specific IP address range; port and protocol filtering is handled separately via `globalRules`.
 
 <ParamField path="spec.cidrRules[].cidr" type="string" required>
   IP address range in CIDR notation (e.g., `10.0.0.0/8`, `192.168.1.0/24`).
@@ -196,7 +196,7 @@ spec:
       protocol: TCP
       direction: egress
 
-  # CIDR-based external rules (max 256)
+  # CIDR-based external rules (max 256); no port/protocol on these entries
   cidrRules:
     - cidr: "10.0.0.0/8"
       direction: egress
@@ -226,7 +226,7 @@ The `duration` field is required and must be positive. After the duration elapse
 The `status` subresource is written by the controller and is read-only from the user's perspective.
 
 <ResponseField name="status.phase" type="string">
-  Current lifecycle phase: `Learning`, `Enforcing`.
+  Current lifecycle phase: `Learning` or `Enforcing`.
 </ResponseField>
 
 <ResponseField name="status.lastAnalyzed" type="string (RFC3339)">

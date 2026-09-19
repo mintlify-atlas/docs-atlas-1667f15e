@@ -1,7 +1,7 @@
 ---
 title: "Network Policy Generator: Kubernetes Operator Overview"
 sidebarTitle: "Introduction"
-description: "Network Policy Generator is a Kubernetes operator that auto-generates NetworkPolicies from observed traffic patterns using learning and enforcing modes with multi-CNI support."
+description: "Auto-generate Kubernetes NetworkPolicies from observed traffic using learning and enforcing modes. Supports Kubernetes, Cilium, and Calico policy engines."
 ---
 
 Network Policy Generator is a Kubernetes operator that eliminates the manual burden of writing and maintaining network segmentation policies. Instead of crafting YAML by hand, you deploy a single `NetworkPolicyGenerator` custom resource and let the operator either observe real traffic in your cluster and surface data-driven recommendations, or immediately generate and enforce policies using rules you define — all backed by your choice of Kubernetes-native, Cilium, or Calico policy engines.

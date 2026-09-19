@@ -1,5 +1,5 @@
 ---
-title: "How Network Policy Generator Works: Internal Architecture"
+title: "How Network Policy Generator Works: Deep Architecture"
 sidebarTitle: "How It Works"
 description: "Internals of Network Policy Generator: reconciler loop, traffic Monitor, Collector, PolicyEngine interface, owner-reference GC, and finalizer lifecycle."
 ---
@@ -27,10 +27,10 @@ type NetworkPolicyGeneratorReconciler struct {
     Watches `NetworkPolicyGenerator` CRs, syncs `status.phase` with `spec.mode`, manages the finalizer, and dispatches to the learning or enforcing handler on every reconcile pass.
   </Card>
   <Card title="Monitor" icon="eye">
-    Runs a background goroutine that ticks every 30 seconds (configurable). On each tick it calls the `Collector` and appends deduplicated `TrafficFlow` records to an in-memory slice protected by a read/write mutex.
+    Runs a background goroutine that ticks every 30 seconds (configurable via `WithCollectInterval`). On each tick it calls the `Collector` and appends deduplicated `TrafficFlow` records to an in-memory slice protected by a read/write mutex.
   </Card>
   <Card title="Collector" icon="database">
-    Lists all pods in the target namespace via the Kubernetes API, inspects each container's declared ports, and parses environment variables whose names contain `host`, `url`, or `endpoint` to infer service-to-service dependencies.
+    Lists all pods in the target namespace via the Kubernetes API, inspects each container's declared ports, and parses environment variables whose names contain `host`, `url`, or `endpoint` (case-insensitive) to infer service-to-service dependencies.
   </Card>
   <Card title="PolicyEngine" icon="gears">
     A Go interface implemented by `KubernetesEngine`, `CiliumEngine`, and `CalicoEngine`. The enforcing handler resolves the correct engine from `spec.policyEngine` and calls `GeneratePolicies`, keeping CNI-specific logic cleanly isolated.
@@ -44,13 +44,13 @@ type NetworkPolicyGeneratorReconciler struct {
   The reconciler calls `r.Get` for the `NetworkPolicyGenerator` identified by the request's namespaced name. A `NotFound` error means the resource has already been fully deleted — the function returns cleanly.
 
   ### Sync phase with mode
-  `syncPhase` maps `spec.mode` (`learning` / `enforcing`) to the corresponding `status.phase` (`Learning` / `Enforcing`) and persists the status. If the phase changed, a `PhaseChanged` event is emitted.
+  `syncPhase` maps `spec.mode` (`learning` / `enforcing`) to the corresponding `status.phase` (`Learning` / `Enforcing`) and persists the status subresource. If the phase changed, a `PhaseChanged` event is emitted.
 
   ### Handle deletion
   If `metadata.deletionTimestamp` is set, the reconciler enters the deletion path (described below) and returns immediately, bypassing the normal mode dispatch.
 
   ### Ensure finalizer
-  On the first reconcile after creation, the reconciler adds the `security.policy.io/finalizer` annotation via `controllerutil.AddFinalizer`. This prevents the API server from garbage-collecting the CR until all generated policies have been cleaned up.
+  On the first reconcile after creation, the reconciler adds the `security.policy.io/finalizer` finalizer via `controllerutil.AddFinalizer`. This prevents the API server from garbage-collecting the CR until all generated policies have been cleaned up.
 
   ### Dispatch to mode handler
   Depending on `spec.mode`, the reconciler calls either `handleLearningMode` or `handleEnforcingMode`. Each handler returns a `ctrl.Result` that tells controller-runtime when to requeue.
@@ -85,7 +85,7 @@ func (m *Monitor) monitorTraffic(ctx context.Context) {
 On each tick the `Collector` does two things for every pod in the namespace:
 
 1. **Container ports** — Each `containerPort` in the pod spec becomes a `TrafficFlow` with the pod as source, the declared protocol, and the port number.
-2. **Environment variable analysis** — Any env var whose lowercased name contains `host`, `url`, or `endpoint` is parsed. The value is split on `:` to extract a hostname and port. Kubernetes in-cluster DNS names (`<service>.<namespace>.svc.cluster.local`) are decomposed to derive the destination namespace and service name.
+2. **Environment variable analysis** — Any env var whose lowercased name contains `host`, `url`, or `endpoint` is parsed. The value is split on `:` to extract a hostname and port (defaulting to port 80 if no port is present). Kubernetes in-cluster DNS names (`<service>.<namespace>.svc.cluster.local`) are decomposed to derive the destination namespace and service name. All env-var-derived flows use the `TCP` protocol.
 
 ```go
 if strings.Contains(strings.ToLower(env.Name), "host") ||
@@ -107,7 +107,7 @@ Once the reconciler enters `handleEnforcingMode`, the workflow is:
 1. If `spec.templateName` is set, the named template merges its defaults into `spec` (user-defined rules always win).
 2. `policy.NewPolicyEngine(spec.policyEngine)` returns a `PolicyEngine` implementation — `KubernetesEngine` by default.
 3. `engine.GeneratePolicies(generator)` returns a `[]runtime.Object` slice.
-4. Each object is applied via `applyPolicyWithDiff`, which issues a **Create** or **Update** against the API server and reports back the action string (`"Created"` / `"Updated"`).
+4. Each object is applied via `applyPolicyWithDiff`, which issues a **Create** or **Update** against the API server and reports back the action string (`"Created"` / `"Updated"` / `"Unchanged"`).
 5. The diff entries are written to `status.policyDiff` and the count to `status.appliedPoliciesCount`.
 
 The `PolicyEngine` interface is intentionally minimal:
@@ -123,7 +123,7 @@ Adding a new CNI engine only requires implementing these two methods and registe
 
 ## Owner References and Garbage Collection
 
-Every generated network policy — whether a Kubernetes `NetworkPolicy`, a `CiliumNetworkPolicy`, or a Calico `NetworkPolicy` — is stamped with an owner reference pointing back to the `NetworkPolicyGenerator` CR that produced it.
+Every generated network policy — whether a Kubernetes `NetworkPolicy`, a `CiliumNetworkPolicy`, or a Calico `NetworkPolicy` — is stamped with an owner reference pointing back to the `NetworkPolicyGenerator` CR that produced it:
 
 ```go
 OwnerReferences: []metav1.OwnerReference{
@@ -155,7 +155,7 @@ When `kubectl delete networkpolicygenerator <name>` is called:
 
 A `PoliciesDeleted` event is emitted and the `PolicyOperations{Deleted}` Prometheus counter is incremented to make the cleanup observable.
 
-## CEL Validation and Admission Webhook
+## CEL Validation
 
 The CRD ships with server-side CEL validation rules enforced directly by the API server — no webhook round-trip is needed for these invariants:
 
@@ -165,4 +165,4 @@ The CRD ships with server-side CEL validation rules enforced directly by the API
 | A namespace cannot appear in both `allowedNamespaces` and `deniedNamespaces` | Rejected at admission |
 | Exactly one of `port` or `namedPort` must be set on each `GlobalRule` | Rejected at admission |
 
-The optional admission webhook adds additional validation — CIDR format checking and cross-field consistency — for clusters where the CEL budget or API server version makes complex expressions impractical.
+These rules are defined directly on the CRD types using `+kubebuilder:validation:XValidation` markers and are enforced by any Kubernetes cluster at v1.25 or later.

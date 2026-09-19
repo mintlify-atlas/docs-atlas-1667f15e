@@ -1,7 +1,7 @@
 ---
-title: "Generating Native Kubernetes NetworkPolicies"
+title: "Generating Kubernetes NetworkPolicies with the Operator"
 sidebarTitle: "Kubernetes Policies"
-description: "Step-by-step guide for generating standard Kubernetes NetworkPolicies with allow and deny approaches, pod-label targeting, and the learning-to-enforcing workflow."
+description: "Generate standard Kubernetes NetworkPolicies with allow and deny modes, pod-label targeting, CIDR rules, and the learning-to-enforcing workflow."
 ---
 
 The `kubernetes` policy engine is the default backend for Network Policy Generator. It produces standard `networking.k8s.io/v1` NetworkPolicy objects that every conformant Kubernetes distribution understands — no additional CNI plugins required. You choose whether the operator should **block traffic from specific namespaces** (allow policy type) or **permit traffic only from an explicit allowlist** (deny policy type), add global port rules on top, and the operator handles creating, updating, and garbage-collecting the generated NetworkPolicy objects on your behalf.
@@ -40,19 +40,23 @@ The `kubernetes` policy engine is the default backend for Network Policy Generat
         app.kubernetes.io/name: network-policy-generator
         app.kubernetes.io/managed-by: kustomize
     spec:
-      mode: "enforcing"
+      mode: "enforcing"  # learning or enforcing
+      # duration: "1m"     # required when mode is learning
 
       policy:
-        type: "allow"
-        deniedNamespaces:       # traffic from these namespaces is blocked
+        type: "allow"     # allow or deny
+        # allowedNamespaces:     # used when type is deny
+        #   - "test-ns1"
+        #   - "test-ns2"
+        deniedNamespaces:      # used when type is allow
           - "test-ns1"
           - "test-ns2"
 
-      globalRules:
-        - type: "allow"
+      globalRules:       # consolidated global rules
+        - type: "allow"  # allow or deny
           port: 80
           protocol: TCP
-          direction: "ingress"
+          direction: "ingress"  # ingress or egress
         - type: "allow"
           port: 443
           protocol: TCP
@@ -76,19 +80,23 @@ The `kubernetes` policy engine is the default backend for Network Policy Generat
         app.kubernetes.io/name: network-policy-generator
         app.kubernetes.io/managed-by: kustomize
     spec:
-      mode: "enforcing"
+      mode: "enforcing"  # learning or enforcing
+      # duration: "1m"     # required when mode is learning
 
       policy:
-        type: "deny"
-        allowedNamespaces:      # only traffic from these namespaces is permitted
+        type: "deny"     # allow or deny
+        allowedNamespaces:     # used when type is deny
           - "test-ns1"
           - "test-ns2"
+        # deniedNamespaces:      # used when type is allow
+        #   - "test-ns3"
+        #   - "test-ns4"
 
-      globalRules:
-        - type: "allow"
+      globalRules:       # consolidated global rules
+        - type: "allow"  # allow or deny
           port: 80
           protocol: TCP
-          direction: "ingress"
+          direction: "ingress"  # ingress or egress
         - type: "allow"
           port: 443
           protocol: TCP
@@ -125,7 +133,7 @@ spec:
     allowedNamespaces:
       - "monitoring"
       - "logging"
-    podSelector:               # restrict policy to pods with these labels
+    podSelector:            # Pod Label Selector: restrict policy to specific pods
       app: "web"
       tier: "frontend"
 

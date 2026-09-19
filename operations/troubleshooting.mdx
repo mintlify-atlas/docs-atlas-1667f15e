@@ -262,14 +262,14 @@ Most problems with Network Policy Generator fall into a small number of categori
   - **Controller pod restarted** — The in-memory timer is reset on restart. The learning window restarts from when the pod came back up.
   - **Clock skew** — Large clock differences between nodes can cause the transition check to lag.
 
-  **Inspect phase and last transition time:**
+  **Inspect phase and last analyzed time:**
 
   ```bash
   kubectl get networkpolicygenerator <name> -n <namespace> \
     -o jsonpath='{.status.phase}'
 
   kubectl get networkpolicygenerator <name> -n <namespace> \
-    -o jsonpath='{.status.lastTransitionTime}'
+    -o jsonpath='{.status.lastAnalyzed}'
   ```
 </Accordion>
 

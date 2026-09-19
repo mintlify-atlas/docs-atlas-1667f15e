@@ -151,7 +151,7 @@ spec:
 
 ## CIDR rules
 
-`spec.cidrRules` (max 256 entries) governs traffic to and from specific IP address ranges outside the Kubernetes pod network — on-premises databases, external SaaS APIs, monitoring infrastructure, or any other CIDR you need to explicitly permit or restrict.
+`spec.cidrRules` (max 256 entries) governs traffic to and from specific IP address ranges outside the Kubernetes pod network — on-premises databases, external SaaS APIs, monitoring infrastructure, or any other CIDR you need to explicitly permit or restrict. CIDR rules control which IP ranges are reachable; port and protocol filtering for those ranges is handled by `globalRules`.
 
 ### Structure of a CIDR rule
 
@@ -219,7 +219,7 @@ Named ports allow you to reference a port by the **name** declared in the pod's 
 
 ### How named ports work
 
-When a global rule specifies `namedPort: "http"`, the generated policy uses an `IntOrString` port reference that Kubernetes resolves at enforcement time by looking up the target pod's container port named `http`.
+When a global rule specifies `namedPort: "http"`, the generated policy uses an `IntOrString` port reference (`intstr.FromString("http")`) that Kubernetes resolves at enforcement time by looking up the target pod's container port named `http`.
 
 ```yaml
 # Pod spec (for reference — not part of the CR)
@@ -275,9 +275,9 @@ Use named ports when deploying to environments where different container images 
 
 ## Automatic DNS egress
 
-All generated policies automatically include an egress rule that allows DNS resolution, regardless of whether you specify it manually. This prevents workloads from losing DNS lookups after a deny-all policy is applied.
+All generated policies automatically include an egress rule that allows DNS resolution on UDP/53 and TCP/53, regardless of whether you specify it manually. This prevents workloads from losing DNS lookups after a deny-all policy is applied.
 
-The auto-appended rule allows both **UDP/53** and **TCP/53** egress to `kube-system`:
+For the standard Kubernetes engine the auto-appended rule allows port 53 traffic without restricting the destination — it opens UDP/53 and TCP/53 egress to any peer:
 
 ```go
 // from internal/policy/rules.go
@@ -299,10 +299,10 @@ This means:
 
 - You do **not** need to add a `port: 53` global rule manually.
 - If you add one anyway it is deduplicated during rule merging.
-- The DNS rule targets `kube-system` where CoreDNS runs by default.
+- The Kubernetes engine DNS rule has no destination restriction — it permits DNS egress to any IP on port 53.
 
 <Info>
-For Cilium policies the DNS rule uses `entity: world` and `toEndpoints` selectors targeting kube-dns pods, which is the idiomatic way to express DNS egress in the Cilium policy model.
+For Cilium policies the DNS rule uses `toEndpoints` targeting pods with label `k8s:k8s-app=kube-dns` in the `kube-system` namespace — the idiomatic way to express DNS egress in the Cilium policy model. For Calico policies it similarly scopes to `kube-dns` pods in `kube-system` using a `namespaceSelector`.
 </Info>
 
 ---

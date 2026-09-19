@@ -21,7 +21,7 @@ When you create a `NetworkPolicyGenerator` with `spec.mode: learning`, the recon
 2. Requeues itself for `spec.duration` in the future.
 3. On requeue, checks whether `spec.duration` has elapsed since `status.lastAnalyzed`.
 4. Once elapsed, calls `buildLearningSuggestions` to populate `status.suggestedNamespaces` and `status.suggestedRules`.
-5. Automatically transitions to enforcing mode by writing `spec.mode: enforcing`.
+5. Writes `status.phase: Enforcing` and then patches `spec.mode: enforcing` on the CR, triggering an immediate requeue into the enforcing handler.
 
 The `Monitor` and `Collector` run in the background throughout the learning window, sampling pod container ports and environment-variable-derived service endpoints every 30 seconds.
 
@@ -31,7 +31,7 @@ The `Monitor` and `Collector` run in the background throughout the learning wind
 |-------|-------------|
 | `spec.mode` | Set to `"learning"` |
 | `spec.duration` | How long to observe traffic (e.g., `"5m"`, `"1h"`). Must be a positive duration. |
-| `spec.policy.type` | Either `"deny"` (default, allowlist model) or `"allow"` (denylist model). |
+| `spec.policy.type` | Either `"deny"` (allowlist model) or `"allow"` (denylist model). |
 
 <Note>
   `spec.duration` is enforced by a CEL validation rule in the CRD. Submitting a `learning` mode CR without a positive duration will be rejected by the API server before the reconciler even runs.
@@ -114,7 +114,7 @@ status:
 
 ### Automatic Transition to Enforcing
 
-After `spec.duration` elapses the operator writes both `status.phase: Enforcing` **and** `spec.mode: enforcing` to the CR. This triggers an immediate requeue into the enforcing handler, which generates and applies policies based on the current spec. The transition emits a `LearningCompleted` Kubernetes event:
+After `spec.duration` elapses, the operator writes `status.phase: Enforcing` and then patches `spec.mode: enforcing` to the CR. This triggers an immediate requeue into the enforcing handler, which generates and applies policies based on the current spec. The transition emits a `LearningCompleted` Kubernetes event:
 
 ```text
 Normal  LearningCompleted  Learning period completed after 10m0s,
@@ -137,9 +137,9 @@ The enforcing handler follows this sequence on each reconcile:
 2. `policy.NewPolicyEngine(spec.policyEngine)` selects the correct engine (`kubernetes` by default).
 3. `engine.GeneratePolicies(generator)` builds the policy objects in memory.
 4. Each generated policy is applied via a Create-or-Update against the API server.
-5. `status.policyDiff` is updated with the action taken (`Created` or `Updated`) for each policy.
+5. `status.policyDiff` is updated with the action taken (`Created`, `Updated`, or `Unchanged`) for each policy.
 6. `status.appliedPoliciesCount` reflects the number of currently managed policies.
-7. The reconciler requeues after `5m` (the default requeue interval) to re-reconcile drift.
+7. The reconciler requeues after `5m` (the `DefaultRequeueInterval` constant) to re-reconcile drift.
 
 ### Required Fields
 
@@ -147,8 +147,8 @@ The enforcing handler follows this sequence on each reconcile:
 |-------|-------------|
 | `spec.mode` | Set to `"enforcing"` |
 | `spec.policy.type` | `"deny"` (allowlist) or `"allow"` (denylist) |
-| `spec.policy.allowedNamespaces` | Namespaces to allow when `type: deny` |
-| `spec.policy.deniedNamespaces` | Namespaces to deny when `type: allow` |
+| `spec.policy.allowedNamespaces` | Namespaces to allow ingress/egress from when `type: deny` |
+| `spec.policy.deniedNamespaces` | Namespaces to block ingress/egress from when `type: allow` |
 
 ### Example: Enforcing CR
 
@@ -166,9 +166,6 @@ spec:
     allowedNamespaces:
       - "test-ns1"
       - "test-ns2"
-    deniedNamespaces:
-      - "test-ns3"
-      - "test-ns4"
 
   globalRules:
     - type: "allow"
@@ -250,8 +247,8 @@ When `dryRun: true` is set:
 
 - Policies are serialized to JSON and stored in `status.generatedPolicies`.
 - `status.appliedPoliciesCount` is set to `0`.
-- `status.policyDiff` is cleared.
-- A `DryRun` event is emitted.
+- `status.policyDiff` is cleared (`null`).
+- A `DryRun` Kubernetes event is emitted.
 
 ```bash
 # Inspect the would-be policies
@@ -286,7 +283,7 @@ The enforcing handler always requeues after `5m` (the `DefaultRequeueInterval` c
 
     - Generates and applies policies immediately
     - Tracks changes in `status.policyDiff`
-    - Supports `spec.dryRun: true` for safe preview
+    - Supports `spec.dryRun: true` for safe preview (policies stored in `status.generatedPolicies`)
     - Self-heals every 5 minutes via requeue
   </Card>
 </CardGroup>

@@ -1,5 +1,5 @@
 ---
-title: "Advanced Features of Network Policy Generator"
+title: "Advanced Features of Network Policy Generator v0.4"
 sidebarTitle: "Advanced Features"
 description: "Deep dive into pod selectors, CIDR rules, named ports, dry-run mode, policy diff auditing, and Kubernetes event recording for Network Policy Generator."
 ---
@@ -31,7 +31,7 @@ Network Policy Generator exposes a rich set of cross-cutting capabilities that w
       allowedNamespaces:
         - "monitoring"
         - "logging"
-      podSelector:              # only pods with BOTH labels are targeted
+      podSelector:            # Pod Label Selector: restrict policy to specific pods
         app: "web"
         tier: "frontend"
 
@@ -75,14 +75,14 @@ Network Policy Generator exposes a rich set of cross-cutting capabilities that w
       allowedNamespaces:
         - "kube-system"
 
-    cidrRules:
-      - cidr: "10.0.0.0/8"         # allow egress to internal network
+    cidrRules:                # CIDR Rules: external IP range based rules
+      - cidr: "10.0.0.0/8"       # Allow egress to internal network
         direction: "egress"
-      - cidr: "192.168.1.0/24"     # allow ingress from specific subnet
+      - cidr: "192.168.1.0/24"   # Allow ingress from specific subnet
         except:
-          - "192.168.1.200/32"     # except this IP
+          - "192.168.1.200/32"   # Except this IP
         direction: "ingress"
-      - cidr: "203.0.113.0/24"     # allow egress to external API server
+      - cidr: "203.0.113.0/24"   # Allow egress to external API server
         direction: "egress"
 
     globalRules:
@@ -125,9 +125,9 @@ Network Policy Generator exposes a rich set of cross-cutting capabilities that w
       podSelector:
         app: "api-server"
 
-    globalRules:
+    globalRules:              # Named Port: use service port names instead of numbers
       - type: "allow"
-        namedPort: "http"         # named port — no numeric value required
+        namedPort: "http"         # Port name defined in Service/Pod spec
         protocol: TCP
         direction: "ingress"
       - type: "allow"
@@ -142,8 +142,8 @@ Network Policy Generator exposes a rich set of cross-cutting capabilities that w
 
   **Engine behaviour:**
   - **Kubernetes** — the port name is passed to `intstr.FromString()` and placed in `NetworkPolicyPort.Port` as a string value.
-  - **Cilium** — the port name is used directly as `CiliumPort.Port`.
-  - **Calico** — the port name is placed in `CalicoEntityRule.Ports` as a string value.
+  - **Cilium** — the port name is used directly as `CiliumPort.port`.
+  - **Calico** — the port name is placed in `CalicoEntityRule.ports` as a string value.
 </Accordion>
 
 <Accordion title="Dry Run Mode — preview policies without applying them">
@@ -161,7 +161,7 @@ Network Policy Generator exposes a rich set of cross-cutting capabilities that w
       app.kubernetes.io/managed-by: kustomize
   spec:
     mode: "enforcing"
-    dryRun: true                # generate but do not apply
+    dryRun: true              # Dry Run: generate policies without applying
 
     policy:
       type: "deny"
@@ -184,6 +184,9 @@ Network Policy Generator exposes a rich set of cross-cutting capabilities that w
     cidrRules:
       - cidr: "10.0.0.0/8"
         direction: "egress"
+
+    # After applying, check status for generated policies:
+    # kubectl get networkpolicygenerator dry-run-example -o jsonpath='{.status.generatedPolicies}'
   ```
 
   Inspect the generated policy JSON with:
@@ -193,7 +196,7 @@ Network Policy Generator exposes a rich set of cross-cutting capabilities that w
   kubectl get networkpolicygenerator dry-run-example \
     -o jsonpath='{.status.generatedPolicies}'
 
-  # Pretty-print each policy
+  # Pretty-print the first generated policy
   kubectl get networkpolicygenerator dry-run-example \
     -o jsonpath='{.status.generatedPolicies[0]}' | jq .
   ```
@@ -285,7 +288,7 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
 spec:
   mode: "enforcing"
-  policyEngine: "kubernetes"
+  policyEngine: "kubernetes"    # kubernetes or cilium
 
   policy:
     type: "deny"
@@ -293,16 +296,16 @@ spec:
       - "kube-system"
       - "monitoring"
       - "istio-system"
-    podSelector:
+    podSelector:                # Target specific pods
       app: "payment-service"
       tier: "backend"
 
   globalRules:
-    - type: "allow"
+    - type: "allow"             # Numeric port
       port: 8443
       protocol: TCP
       direction: "ingress"
-    - type: "allow"
+    - type: "allow"             # Named port
       namedPort: "metrics"
       protocol: TCP
       direction: "ingress"
@@ -312,14 +315,19 @@ spec:
       direction: "egress"
 
   cidrRules:
-    - cidr: "10.0.0.0/8"
+    - cidr: "10.0.0.0/8"       # Internal network egress
       direction: "egress"
-    - cidr: "172.16.0.0/12"
+    - cidr: "172.16.0.0/12"    # Private network egress
       direction: "egress"
-    - cidr: "203.0.113.0/24"
+    - cidr: "203.0.113.0/24"   # External API ingress
       except:
-        - "203.0.113.128/25"
+        - "203.0.113.128/25"   # Exclude half of the range
       direction: "ingress"
+
+  # Status will include:
+  # - policyDiff: tracks Created/Updated actions per policy
+  # - appliedPoliciesCount: number of applied policies
+  # - generatedPolicies: (only in dryRun mode) JSON of generated policies
 ```
 
 After applying, check everything in one command:

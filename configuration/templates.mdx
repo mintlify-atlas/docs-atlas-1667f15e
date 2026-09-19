@@ -18,7 +18,7 @@ When `spec.templateName` is set, the controller calls the template's `Apply` fun
     Template rules whose keys are **not already present** in the user list are appended. Rules whose keys collide with a user rule are silently dropped.
   </Step>
   <Step title="DNS egress is always appended">
-    After merging, the controller appends an egress rule for UDP/53 and TCP/53 toward `kube-system`. This happens independently of any template and cannot be disabled.
+    After merging, the controller appends an egress rule for UDP/53 and TCP/53. For the Kubernetes engine this rule has no destination restriction. For Cilium it targets kube-dns pods in `kube-system`; for Calico it similarly scopes to `kube-dns` in `kube-system`. This step is independent of any template and cannot be disabled.
   </Step>
 </Steps>
 

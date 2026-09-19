@@ -312,12 +312,23 @@ helm install npg oci://ghcr.io/somaz94/charts/network-policy-generator \
 
 ### Upgrading
 
-```bash
-helm repo update
-helm upgrade npg oci://ghcr.io/somaz94/charts/network-policy-generator \
-  --namespace network-policy-generator-system \
-  -f custom-values.yaml
-```
+<Tabs>
+  <Tab title="OCI registry">
+    ```bash
+    helm upgrade npg oci://ghcr.io/somaz94/charts/network-policy-generator \
+      --namespace network-policy-generator-system \
+      -f custom-values.yaml
+    ```
+  </Tab>
+  <Tab title="Helm repository">
+    ```bash
+    helm repo update
+    helm upgrade npg network-policy-generator/network-policy-generator \
+      --namespace network-policy-generator-system \
+      -f custom-values.yaml
+    ```
+  </Tab>
+</Tabs>
 
 ### Uninstalling
 

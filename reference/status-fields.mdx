@@ -31,7 +31,6 @@ kubectl describe networkpolicygenerator my-generator -n my-app
   |-------|---------|
   | `Learning` | The operator is collecting traffic observations within the configured `spec.duration` window |
   | `Enforcing` | The operator is generating and applying (or dry-running) NetworkPolicies |
-  | `Error` | The last reconcile loop encountered a terminal error; see Events for details |
 
   The `Phase` column is also surfaced in `kubectl get` output via the printer column
   annotation on the CRD.
@@ -42,11 +41,6 @@ kubectl describe networkpolicygenerator my-generator -n my-app
   # my-generator   Learning    2024-11-01T12:00:00Z     5m
   ```
 
-  ```bash
-  # Filter only generators in Error phase
-  kubectl get networkpolicygenerator -A -o json | \
-    jq '.items[] | select(.status.phase=="Error") | .metadata.name'
-  ```
 </ResponseField>
 
 <ResponseField name="status.lastAnalyzed" type="string (RFC3339 timestamp)">
@@ -284,15 +278,6 @@ The following three fields are populated **only** during `Learning` phase. They 
              observedTraffic                       appliedPoliciesCount
              suggestedNamespaces                   policyDiff
              suggestedRules                        generatedPolicies (dryRun)
-                    │                                     │
-                    └──────────────┬──────────────────────┘
-                                   │
-                              reconcile error
-                                   │
-                                   ▼
-                              ┌─────────┐
-                              │  Error  │
-                              └─────────┘
 ```
 
 ## Watching Status Events

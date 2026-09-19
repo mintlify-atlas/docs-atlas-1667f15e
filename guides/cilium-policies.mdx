@@ -1,7 +1,7 @@
 ---
 title: "Generating Cilium NetworkPolicies with the Operator"
 sidebarTitle: "Cilium Policies"
-description: "Complete guide for generating CiliumNetworkPolicy resources using the cilium engine, including allow/deny modes, endpoint selectors, and DNS egress rules."
+description: "Generate CiliumNetworkPolicy resources using the cilium engine, covering allow/deny modes, endpoint selectors, named ports, and automatic DNS egress."
 ---
 
 When `spec.policyEngine` is set to `cilium`, Network Policy Generator emits `CiliumNetworkPolicy` resources (`cilium.io/v2`) instead of standard Kubernetes NetworkPolicy objects. CiliumNetworkPolicy offers L3–L7 visibility, identity-based access control through Cilium's endpoint model, and first-class support for `ingressDeny`/`egressDeny` semantics — making it a natural fit for clusters already running Cilium as their CNI. The operator handles all `CiliumEndpointSelector` construction, namespace-to-label mapping, and automatic DNS egress rules on your behalf.

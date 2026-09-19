@@ -1,5 +1,5 @@
 ---
-title: "NetworkPolicyGenerator CRD API Reference"
+title: "NetworkPolicyGenerator API Spec: Fields and Constraints"
 sidebarTitle: "API Spec"
 description: "Field-by-field reference for the NetworkPolicyGenerator custom resource: spec, policy, globalRules, and cidrRules with types, defaults, and constraints."
 ---
@@ -171,13 +171,8 @@ Each entry in `globalRules` represents a single port/protocol/direction traffic 
 </ParamField>
 
 <ParamField path="spec.globalRules[].direction" type="string" required>
-  Traffic direction: `ingress` or `egress`.
-
-  <Note>
-    The source types support a `both` value in the task description, but the CRD
-    enum is strictly `ingress` or `egress`. Create two separate rules if you need
-    to permit a port in both directions.
-  </Note>
+  Traffic direction: `ingress` or `egress`. The CRD enum is strictly `ingress` or
+  `egress`. Create two separate rules if you need to permit a port in both directions.
 </ParamField>
 
 ---

@@ -1,7 +1,7 @@
 ---
 title: "Generating Calico NetworkPolicies with the Operator"
 sidebarTitle: "Calico Policies"
-description: "Complete guide for generating Calico NetworkPolicy resources using the calico engine, including allow/deny modes, selector expressions, and automatic DNS rules."
+description: "Generate Calico NetworkPolicy resources using the calico engine, covering allow/deny modes, selector expressions, CIDR rules, and automatic DNS egress."
 ---
 
 Setting `spec.policyEngine: calico` switches Network Policy Generator to the Calico backend. Instead of standard Kubernetes `networking.k8s.io/v1` NetworkPolicy objects, the operator emits `crd.projectcalico.org/v1` NetworkPolicy resources that are native to Calico and unlock Calico-specific capabilities such as ordered policy precedence, `projectcalico.org/name` namespace selectors, and explicit `Allow`/`Deny` actions per rule. The operator constructs every selector expression, order value, and DNS egress rule automatically — you only need to declare intent in the `NetworkPolicyGenerator` spec.
@@ -57,13 +57,11 @@ metadata:
 spec:
   mode: "enforcing"
   policyEngine: "calico"
-
   policy:
     type: "allow"
     deniedNamespaces:          # ingress/egress from these namespaces is denied
       - "test-ns1"
       - "test-ns2"
-
   globalRules:
     - type: "allow"
       port: 80
@@ -116,12 +114,10 @@ metadata:
 spec:
   mode: "enforcing"
   policyEngine: "calico"
-
   policy:
     type: "deny"
     allowedNamespaces:         # only traffic from this namespace is permitted
       - "test-ns3"
-
   globalRules:
     - type: "allow"
       port: 80
