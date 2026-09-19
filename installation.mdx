@@ -1,0 +1,337 @@
+---
+title: "Installing Network Policy Generator on Kubernetes"
+sidebarTitle: "Installation"
+description: "Install Network Policy Generator via Helm OCI registry, kubectl apply, or source build. Covers prerequisites, verification, webhook setup, and uninstall for all methods."
+---
+
+Network Policy Generator ships as a single Kubernetes operator binary packaged in three ways: an OCI Helm chart (the recommended path), a standalone `install.yaml` manifest for quick one-liners, and a full source build for contributors or advanced customization. All three paths deploy the same container image (`somaz940/network-policy-generator:v0.4.0`) into the `network-policy-generator-system` namespace and install the `NetworkPolicyGenerator` CRD.
+
+## Prerequisites
+
+Before installing, confirm your environment satisfies the following requirements:
+
+| Requirement | Version | Notes |
+|---|---|---|
+| Kubernetes | v1.25+ | CEL validation rules in the CRD require v1.25+; earlier clusters are unsupported |
+| kubectl | v1.11.3+ | Any modern release works for managing resources and CRDs |
+| Helm | 3.8+ | Helm 3.8+ is required for OCI registry (`oci://`) support |
+| cert-manager | Any | Required **only** when enabling the optional admission webhook (`--enable-webhooks`) |
+
+<Warning>
+  If you plan to use `policyEngine: cilium`, Cilium CNI must already be installed and running on your cluster before creating any `NetworkPolicyGenerator` resources. Similarly, `policyEngine: calico` requires Calico CNI. The operator itself will install without either CNI, but policy reconciliation will fail if the target CNI CRDs are absent.
+</Warning>
+
+## Installation Methods
+
+<Tabs>
+  <Tab title="Helm (Recommended)">
+    Helm is the recommended installation method. It manages CRD lifecycle, configures RBAC, and makes it easy to customise resource limits, image tags, and controller flags through a values file.
+
+    <Steps>
+      <Step title="Install from the OCI registry">
+        The chart is published to GitHub Container Registry. No `helm repo add` is required — Helm 3.8+ fetches it directly from the OCI URL.
+
+        ```bash
+        helm install npg oci://ghcr.io/somaz94/charts/network-policy-generator \
+          --version 0.4.0 \
+          --namespace npg-system --create-namespace
+        ```
+
+        <Tip>
+          Using `--namespace npg-system --create-namespace` keeps the operator isolated from the default `network-policy-generator-system` namespace used by `kubectl apply`. You can use any namespace you prefer.
+        </Tip>
+      </Step>
+
+      <Step title="(Alternative) Install from the classic Helm repository">
+        If your environment cannot reach OCI registries, use the traditional Helm repository instead:
+
+        ```bash
+        # Add and update the repository
+        helm repo add network-policy-generator \
+          https://somaz94.github.io/network-policy-generator/helm-repo
+        helm repo update
+
+        # Install with defaults
+        helm install npg network-policy-generator/network-policy-generator
+
+        # Or specify a namespace
+        helm install npg network-policy-generator/network-policy-generator \
+          --namespace npg-system --create-namespace
+        ```
+      </Step>
+
+      <Step title="(Optional) Install with custom values">
+        Override chart values inline or via a values file for production deployments:
+
+        ```bash
+        # Inline overrides
+        helm install npg network-policy-generator/network-policy-generator \
+          --set image.tag=v0.4.0 \
+          --set crds.cleanup=false \
+          --namespace npg-system --create-namespace
+        ```
+
+        Or create a `custom-values.yaml` and pass it with `-f`:
+
+        ```yaml
+        image:
+          tag: v0.4.0
+
+        namespace: npg-system
+
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+
+        controller:
+          leaderElect: true
+
+        crds:
+          cleanup: false  # Keep CRDs when helm uninstall runs
+        ```
+
+        ```bash
+        helm install npg network-policy-generator/network-policy-generator \
+          -f custom-values.yaml --namespace npg-system --create-namespace
+        ```
+      </Step>
+
+      <Step title="Verify the installation">
+        ```bash
+        # Confirm the controller pod is Running
+        kubectl get pods -n npg-system
+
+        # Confirm the CRD is registered
+        kubectl get crd networkpolicygenerators.security.policy.io
+        ```
+
+        Expected output:
+
+        ```bash
+        NAME                                          READY   STATUS    RESTARTS   AGE
+        npg-network-policy-generator-<hash>           1/1     Running   0          30s
+
+        NAME                                              CREATED AT
+        networkpolicygenerators.security.policy.io        2024-01-01T00:00:00Z
+        ```
+      </Step>
+    </Steps>
+
+    ### Helm Values Reference
+
+    The table below lists every configurable value in the chart:
+
+    | Parameter | Description | Default |
+    |---|---|---|
+    | `namespace` | Namespace for the controller | `network-policy-generator-system` |
+    | `image.repository` | Controller image repository | `somaz940/network-policy-generator` |
+    | `image.tag` | Controller image tag | `v0.4.0` |
+    | `image.pullPolicy` | Image pull policy | `IfNotPresent` |
+    | `serviceAccount.create` | Create the service account | `true` |
+    | `serviceAccount.name` | Service account name | `network-policy-generator-controller-manager` |
+    | `podSecurityContext.runAsNonRoot` | Run pod as non-root | `true` |
+    | `securityContext.allowPrivilegeEscalation` | Disallow privilege escalation | `false` |
+    | `securityContext.capabilities.drop` | Dropped Linux capabilities | `["ALL"]` |
+    | `resources.limits.cpu` | CPU limit | `500m` |
+    | `resources.limits.memory` | Memory limit | `128Mi` |
+    | `resources.requests.cpu` | CPU request | `10m` |
+    | `resources.requests.memory` | Memory request | `64Mi` |
+    | `controller.metricsBindAddress` | Metrics bind address | `:8443` |
+    | `controller.healthProbeBindAddress` | Health probe bind address | `:8081` |
+    | `controller.leaderElect` | Enable leader election | `true` |
+    | `service.type` | Metrics service type | `ClusterIP` |
+    | `service.port` | Metrics service port | `8443` |
+    | `probes.liveness.initialDelaySeconds` | Liveness probe initial delay | `15` |
+    | `probes.liveness.periodSeconds` | Liveness probe period | `20` |
+    | `probes.readiness.initialDelaySeconds` | Readiness probe initial delay | `5` |
+    | `probes.readiness.periodSeconds` | Readiness probe period | `10` |
+    | `rbac.enabled` | Create RBAC resources | `true` |
+    | `crds.enabled` | Install CRDs | `true` |
+    | `crds.cleanup` | Delete CRDs on `helm uninstall` | `true` |
+    | `metrics.enabled` | Enable metrics service | `true` |
+    | `metrics.port` | Metrics port | `8443` |
+
+    ### Upgrade
+
+    ```bash
+    helm repo update
+    helm upgrade npg network-policy-generator/network-policy-generator
+    ```
+
+    ### Uninstall
+
+    ```bash
+    helm uninstall npg
+    ```
+
+    <Note>
+      With `crds.cleanup: true` (the default), `helm uninstall` removes the `NetworkPolicyGenerator` CRD and all associated resources. Set `crds.cleanup: false` in your values file if you want to preserve existing `NetworkPolicyGenerator` objects after uninstalling the operator.
+    </Note>
+  </Tab>
+
+  <Tab title="kubectl apply">
+    The quickest way to get the operator running is a single `kubectl apply` command against the published `install.yaml` manifest. This is ideal for CI environments, local development clusters, and rapid prototyping.
+
+    <Steps>
+      <Step title="Apply the install manifest">
+        ```bash
+        kubectl apply -f https://raw.githubusercontent.com/somaz94/network-policy-generator/main/dist/install.yaml
+        ```
+
+        This manifest installs the CRD, RBAC resources, and the controller `Deployment` in the `network-policy-generator-system` namespace.
+      </Step>
+
+      <Step title="Wait for the controller to become ready">
+        ```bash
+        kubectl rollout status deployment/network-policy-generator-controller-manager \
+          -n network-policy-generator-system
+        ```
+      </Step>
+
+      <Step title="Verify the installation">
+        ```bash
+        # Check the controller pod
+        kubectl get pods -n network-policy-generator-system
+
+        # Check the CRD
+        kubectl get crd networkpolicygenerators.security.policy.io
+        ```
+      </Step>
+    </Steps>
+
+    ### Uninstall
+
+    ```bash
+    kubectl delete -f https://raw.githubusercontent.com/somaz94/network-policy-generator/main/dist/install.yaml
+    ```
+
+    <Warning>
+      Deleting the install manifest also removes the `NetworkPolicyGenerator` CRD. All `NetworkPolicyGenerator` resources in the cluster will be deleted along with any `NetworkPolicy` objects they manage. Back up any resources you want to preserve before uninstalling.
+    </Warning>
+  </Tab>
+
+  <Tab title="Build from Source">
+    Building from source gives you full control over the operator binary, lets you run the controller outside the cluster during development, and is the path used by contributors.
+
+    <Steps>
+      <Step title="Clone the repository">
+        ```bash
+        git clone https://github.com/somaz94/network-policy-generator.git
+        cd network-policy-generator
+        ```
+
+        <Info>
+          The project requires **Go 1.26+** and **controller-runtime v0.25.0**. Run `go version` to confirm before proceeding.
+        </Info>
+      </Step>
+
+      <Step title="Install the CRDs into your cluster">
+        ```bash
+        make install
+        ```
+
+        This command runs `kubectl apply` on the generated CRD manifests in `config/crd/bases/`.
+      </Step>
+
+      <Step title="Build and deploy the controller image">
+        ```bash
+        make deploy IMG=somaz940/network-policy-generator:v0.4.0
+        ```
+
+        To build your own image from source and push it before deploying:
+
+        ```bash
+        # Build and push your custom image
+        make docker-build docker-push IMG=<your-registry>/network-policy-generator:<tag>
+
+        # Deploy using your custom image
+        make deploy IMG=<your-registry>/network-policy-generator:<tag>
+        ```
+      </Step>
+
+      <Step title="Verify the installation">
+        ```bash
+        kubectl get pods -n network-policy-generator-system
+        kubectl get crd networkpolicygenerators.security.policy.io
+        ```
+      </Step>
+    </Steps>
+
+    ### Uninstall
+
+    ```bash
+    # Remove the controller Deployment and RBAC
+    make undeploy
+
+    # Remove the CRDs
+    make uninstall
+    ```
+  </Tab>
+</Tabs>
+
+## Optional: Enable Admission Webhooks
+
+By default, the operator relies on CEL `x-kubernetes-validations` rules embedded in the CRD for schema enforcement. An optional admission webhook adds extra checks that the CRD schema cannot express — most notably CIDR-format validation for `spec.cidrRules`.
+
+<Warning>
+  The admission webhook requires **cert-manager** to provision and rotate the TLS certificates it uses. Install cert-manager before enabling webhooks.
+</Warning>
+
+To enable the webhook, pass `--enable-webhooks` to the operator binary. When deployed via Helm, add it as an extra argument in your values file:
+
+```yaml
+# custom-values.yaml
+controller:
+  extraArgs:
+    - --enable-webhooks
+```
+
+When deployed via `kubectl apply` or from source, patch the controller `Deployment`:
+
+```bash
+kubectl patch deployment network-policy-generator-controller-manager \
+  -n network-policy-generator-system \
+  --type='json' \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--enable-webhooks"}]'
+```
+
+<Info>
+  Without the webhook, the CRD's CEL rules still reject invalid resources — for example, a `learning` mode resource with no `duration`, or a `globalRules` entry with both `port` and `namedPort` set. The webhook adds CIDR format validation on top of those built-in checks.
+</Info>
+
+## Verifying a Successful Installation
+
+Run these commands after any installation method to confirm everything is healthy:
+
+```bash
+# 1. Controller pod is Running
+kubectl get pods -n network-policy-generator-system
+
+# 2. CRD is registered and available
+kubectl get crd networkpolicygenerators.security.policy.io
+
+# 3. API group is discoverable
+kubectl api-resources --api-group=security.policy.io
+```
+
+Expected output for step 3:
+
+```bash
+NAME                       SHORTNAMES   APIVERSION              NAMESPACED   KIND
+networkpolicygenerators                 security.policy.io/v1   true         NetworkPolicyGenerator
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quick Start Guide" icon="rocket" href="/quickstart">
+    Create your first `NetworkPolicyGenerator`, observe traffic in learning mode, and enforce generated policies.
+  </Card>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Learn about the operator's architecture, policy engines, and built-in templates.
+  </Card>
+</CardGroup>

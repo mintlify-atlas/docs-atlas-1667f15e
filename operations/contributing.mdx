@@ -1,0 +1,316 @@
+---
+title: "Contributor Guide for Network Policy Generator Operator"
+sidebarTitle: "Contributing"
+description: "Set up a local dev environment, follow the branch-test-PR workflow, regenerate CRD manifests, and cut a release for Network Policy Generator."
+---
+
+Network Policy Generator is built with [kubebuilder](https://book.kubebuilder.io/) on top of [controller-runtime](https://pkg.go.dev/sigs.k8s.io/controller-runtime) and welcomes contributions of all sizes — from typo fixes to new policy engines. The sections below walk through everything from installing prerequisites to tagging a release, with exact `make` targets drawn directly from the project's `Makefile`.
+
+---
+
+## Prerequisites
+
+<CardGroup cols={2}>
+  <Card title="Go 1.26+" icon="golang">
+    The project pins the Go toolchain via `go.mod`. Install from [go.dev/dl](https://go.dev/dl/) and ensure `go version` reports `1.26` or later.
+  </Card>
+  <Card title="Docker 17.03+" icon="docker">
+    Required for container builds and multi-arch `buildx` targets. Enable BuildKit for faster builds.
+  </Card>
+  <Card title="kubectl v1.11.3+" icon="terminal">
+    Must be configured with a reachable `~/.kube/config` for integration and Helm tests.
+  </Card>
+  <Card title="Kind (recommended)" icon="box">
+    [Kind](https://kind.sigs.k8s.io/) (Kubernetes in Docker) is the recommended local cluster for E2E tests. Install with `go install sigs.k8s.io/kind@latest`.
+  </Card>
+</CardGroup>
+
+---
+
+## Initial Setup
+
+Clone the repository and install all development tooling in one step:
+
+```bash
+git clone https://github.com/somaz94/network-policy-generator.git
+cd network-policy-generator
+
+# Installs: controller-gen, kustomize, setup-envtest, golangci-lint + envtest k8s binaries
+make install-tools
+```
+
+`make install-tools` downloads all pinned tool versions into `./bin/` so they never conflict with system-wide installations.
+
+---
+
+## Development Workflow
+
+<Steps>
+  <Step title="Create a feature branch">
+    Branch off `main` using the Makefile helper (it pulls `main` and prefixes `feat/` automatically) or with a plain `git checkout`:
+
+    ```bash
+    # Via Makefile (pulls main, creates feat/<name>)
+    make branch name=your-feature
+
+    # Or manually
+    git checkout main && git pull origin main
+    git checkout -b feat/your-feature
+    ```
+  </Step>
+
+  <Step title="Make changes">
+    Edit source files under `api/v1/`, `internal/controller/`, `internal/policy/`, or wherever your change lives.
+
+    <Note>
+      The correct path for `podSelector` in the CRD is `spec.policy.podSelector`, **not** `spec.podSelector`. This is a known source of confusion — double-check when touching selector logic.
+    </Note>
+  </Step>
+
+  <Step title="Regenerate manifests (if API types changed)">
+    Any change to `api/v1/networkpolicygenerator_types.go` requires regenerating the CRD and DeepCopy code. Commit the output along with your type changes:
+
+    ```bash
+    make manifests generate
+    ```
+
+    `manifests` regenerates `config/crd/bases/`, ClusterRole, and WebhookConfiguration YAML.
+    `generate` regenerates the `zz_generated.deepcopy.go` file.
+
+    <Warning>
+      When you add or change CRD fields you must also copy the updated CRD from `config/crd/bases/` into `helm/network-policy-generator/crds/` so the Helm chart stays in sync.
+    </Warning>
+  </Step>
+
+  <Step title="Format, vet, and lint">
+    All three checks are enforced in CI. Run them locally before pushing to avoid a round-trip:
+
+    ```bash
+    make fmt       # go fmt ./...
+    make vet       # go vet ./...
+    make lint      # golangci-lint run (staticcheck, errcheck, etc.)
+    make lint-fix  # auto-fix where possible
+    ```
+
+    The project uses `staticcheck` with strict settings — prefer `switch` over `if-else if` chains (QF1003).
+  </Step>
+
+  <Step title="Run tests">
+    Start with the fast unit suite, then run integration or Helm tests if your change touches reconciler or chart logic:
+
+    ```bash
+    make test               # unit tests (envtest, no live cluster needed)
+    make test-integration   # integration tests (requires running cluster)
+    make test-helm          # full Helm chart lifecycle tests
+    make test-e2e           # E2E on Kind (requires running Kind cluster)
+    ```
+
+    See the [Testing guide](/operations/testing) for `ENGINE=` variants and per-test-case details.
+  </Step>
+
+  <Step title="Commit with Conventional Commits">
+    The project uses [Conventional Commits](https://www.conventionalcommits.org/) to drive automated changelog generation. Use one of the prefixes from the table below:
+
+    ```bash
+    git commit -m "feat: add support for egress policies"
+    git commit -m "fix: correct podSelector path in Calico engine"
+    git commit -m "docs: update Helm values reference"
+    ```
+  </Step>
+
+  <Step title="Push and open a PR">
+    Push your branch and open a Pull Request on GitHub. The `make pr` helper runs tests, pushes, and creates the PR in one command (requires `gh` CLI):
+
+    ```bash
+    # Via Makefile helper (runs tests, pushes, creates PR)
+    make pr title="feat: add support for egress policies"
+
+    # Or manually
+    git push origin feat/your-feature
+    # then open a PR on GitHub
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Conventional Commits Reference
+
+| Prefix | When to use |
+|--------|-------------|
+| `feat:` | A new feature visible to users or operators |
+| `fix:` | A bug fix |
+| `docs:` | Documentation-only changes |
+| `ci:` | Changes to CI/CD workflows or scripts |
+| `chore:` | Maintenance tasks — dependency bumps, version updates, generated file updates |
+| `refactor:` | Code restructuring with no functional change |
+| `test:` | Adding or modifying tests |
+
+---
+
+## Code Structure
+
+```text
+api/v1/                         # CRD type definitions + webhook
+  networkpolicygenerator_types.go
+  networkpolicygenerator_webhook.go
+  zz_generated.deepcopy.go
+
+internal/controller/            # Reconciliation logic
+  networkpolicygenerator_controller.go
+  module_handlers.go
+  metrics.go
+
+internal/policy/                # Policy generation engines
+  generator.go                  # Engine interface and dispatch
+  engine.go
+  kubernetes.go                 # Kubernetes native NetworkPolicy
+  cilium.go                     # CiliumNetworkPolicy
+  calico.go                     # Calico NetworkPolicy
+  templates.go                  # Built-in policy templates
+  validator.go
+  rules.go
+
+internal/monitor/               # Traffic monitoring
+  monitor.go
+  collector.go
+
+config/
+  crd/                          # Generated CRD manifests
+  default/                      # Kustomize default overlay
+  manager/                      # Controller Deployment
+  rbac/                         # ClusterRole / ClusterRoleBinding
+  webhook/                      # Webhook configurations
+  prometheus/                   # Prometheus ServiceMonitor
+  samples/                      # Sample CR YAML files
+
+helm/
+  network-policy-generator/     # Helm chart (values, templates, crds/)
+
+hack/                           # Helper scripts
+  bump-version.sh
+  test-integration.sh
+  test-helm.sh
+
+test/
+  e2e/                          # Ginkgo E2E suite
+  utils/
+
+cmd/
+  main.go                       # Operator entrypoint and flag definitions
+```
+
+---
+
+## Running the Operator Locally
+
+You can run the controller manager directly on your host against a live cluster without building a container image:
+
+```bash
+make run
+```
+
+This compiles the binary and calls `go run ./cmd/main.go` after running `manifests`, `generate`, `fmt`, and `vet`. Your local `~/.kube/config` is used for cluster access.
+
+<Tip>
+  Combine `make run` with `kubectl apply -f config/samples/<cr>.yaml` to iterate quickly on reconciler changes without rebuilding the container image.
+</Tip>
+
+---
+
+## Building the Container Image
+
+```bash
+# Local single-arch build
+make docker-build
+
+# Push to registry
+make docker-push
+
+# Multi-arch build and push (linux/amd64, linux/arm64, linux/s390x, linux/ppc64le)
+make docker-buildx
+```
+
+The multi-arch target uses `docker buildx` with a cross-platform `Dockerfile`. A BuildKit builder is created automatically. The runtime image is `gcr.io/distroless/static:nonroot` (no shell, minimal attack surface).
+
+---
+
+## Generating a Consolidated Install Manifest
+
+For users who prefer a single-file install, regenerate `dist/install.yaml` after any change that affects manifests:
+
+```bash
+make build-installer
+```
+
+This runs `kustomize build config/default` and writes the output to `dist/install.yaml`, which is published with each release.
+
+---
+
+## Release Workflow
+
+<Steps>
+  <Step title="Bump the version">
+    `make bump-version` updates the version string in `Makefile`, `helm/network-policy-generator/Chart.yaml`, `helm/network-policy-generator/values.yaml`, `README.md`, docs, and `dist/install.yaml` in a single operation:
+
+    ```bash
+    make bump-version VERSION=vX.Y.Z
+    ```
+  </Step>
+
+  <Step title="Commit and push">
+    ```bash
+    git add -A
+    git commit -m "chore: bump version to vX.Y.Z"
+    git push origin main
+    ```
+  </Step>
+
+  <Step title="Build and push the multi-arch image">
+    ```bash
+    make docker-buildx
+    ```
+
+    This builds and pushes both a version-tagged image (`somaz940/network-policy-generator:vX.Y.Z`) and updates the `latest` tag.
+  </Step>
+
+  <Step title="Tag the release">
+    ```bash
+    git tag vX.Y.Z
+    git push origin vX.Y.Z
+    ```
+
+    Pushing a `v*` tag automatically triggers three CI workflows:
+    - `release.yml` — creates the GitHub Release with a `git-cliff`-generated changelog
+    - `helm-release.yml` — packages and publishes the Helm chart to `oci://ghcr.io/somaz94/charts/network-policy-generator`
+    - `changelog-generator.yml` — updates `CHANGELOG.md` and `CONTRIBUTORS.md` on `main`
+  </Step>
+</Steps>
+
+<Info>
+  The `GITHUB_TOKEN` used by the release workflow does **not** trigger downstream workflows (GitHub prevents circular triggers). If you need a tag push to cascade into further workflows, configure a `PAT_TOKEN` secret in the repository settings.
+</Info>
+
+---
+
+## CI/CD Workflows Reference
+
+| Workflow | Trigger | Description |
+|----------|---------|-------------|
+| `test.yml` | push, PR, manual dispatch | Unit tests + manifest verification |
+| `test-e2e.yml` | push, PR, manual dispatch | E2E tests on Kind cluster |
+| `lint.yml` | manual dispatch | golangci-lint |
+| `release.yml` | tag push `v*` | GitHub Release + changelog |
+| `helm-release.yml` | tag push, manual dispatch | Package & publish Helm chart to GHCR |
+| `changelog-generator.yml` | after release, PR merge | Auto-generate `CHANGELOG.md` |
+| `contributors.yml` | after changelog | Auto-generate `CONTRIBUTORS.md` |
+| `gitlab-mirror.yml` | push to `main` | Mirror repository to GitLab |
+| `stale-issues.yml` | daily cron | Auto-close stale issues |
+| `dependabot-auto-merge.yml` | Dependabot PR | Auto-merge minor/patch dependency updates |
+| `issue-greeting.yml` | issue opened | Welcome message for new issues |
+
+---
+
+## Questions and Issues
+
+Open a [GitHub issue](https://github.com/somaz94/network-policy-generator/issues) for bug reports, feature requests, or general questions. For larger changes, consider opening an issue first to discuss the approach before investing time in implementation.

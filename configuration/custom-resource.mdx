@@ -1,0 +1,258 @@
+---
+title: "NetworkPolicyGenerator Custom Resource Full Reference"
+sidebarTitle: "Custom Resource"
+description: "Complete field-by-field reference for the NetworkPolicyGenerator CRD spec, covering mode, policy engine, rules, and CIDR configuration."
+---
+
+The `NetworkPolicyGenerator` custom resource is the single configuration object that drives the entire lifecycle of network policy management — from passively observing traffic in `learning` mode to generating and enforcing policies in `enforcing` mode. Every aspect of what gets generated, which CNI plugin handles enforcement, and which namespaces and CIDRs are in scope is expressed through this resource's `spec`.
+
+## API Reference
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+```
+
+**Group:** `security.policy.io` · **Version:** `v1` · **Scope:** Namespaced
+
+<Info>
+The CRD uses CEL (Common Expression Language) validation rules enforced directly by the Kubernetes API server. Invalid combinations — such as omitting `duration` in learning mode, or listing the same namespace in both `allowedNamespaces` and `deniedNamespaces` — are rejected at admission time with a descriptive error message.
+</Info>
+
+---
+
+## Top-level spec fields
+
+<ParamField path="spec.mode" type="string" default="learning">
+  Operation mode of the generator. One of `learning` or `enforcing`.
+
+  - **`learning`** — The controller observes pod-to-pod traffic and records patterns in `status.observedTraffic`. No NetworkPolicies are created or modified. Transitions to enforcing after `spec.duration` elapses.
+  - **`enforcing`** — The controller generates and applies NetworkPolicies based on `spec.policy`, `spec.globalRules`, and `spec.cidrRules`. Policies are reconciled on every change to the resource.
+
+  <Warning>
+  CEL validation rule: when `mode` is `learning`, `spec.duration` **must** be set and must be a positive duration (e.g., `5m`, `1h`). The API server will reject the resource otherwise.
+  </Warning>
+</ParamField>
+
+<ParamField path="spec.duration" type="string (duration)">
+  How long to observe traffic before the controller transitions to `enforcing`. Required when `spec.mode` is `learning`. Expressed as a Go duration string — e.g., `30s`, `5m`, `2h`.
+
+  A zero duration (`0s`) is explicitly rejected by the CEL rule so that a misconfigured resource never silently skips the learning phase.
+</ParamField>
+
+<ParamField path="spec.policyEngine" type="string" default="kubernetes">
+  Selects the CNI plugin API used when writing generated policies. One of:
+
+  | Value | Generated resource | API version |
+  |---|---|---|
+  | `kubernetes` | `NetworkPolicy` | `networking.k8s.io/v1` |
+  | `cilium` | `CiliumNetworkPolicy` | `cilium.io/v2` |
+  | `calico` | `NetworkPolicy` | `crd.projectcalico.org/v1` |
+
+  The cluster must have the corresponding CNI installed. Changing `policyEngine` on an existing resource causes the old policies to be deleted and new ones to be created under the target API.
+</ParamField>
+
+<ParamField path="spec.templateName" type="string">
+  Name of a built-in policy template to use as a baseline. When set, the template pre-populates `globalRules` with sensible defaults for the target workload type. User-defined `globalRules` are merged on top — if the same port/direction/protocol key exists in both, the user rule wins.
+
+  Valid values: `zero-trust`, `web-app`, `backend-api`, `database`, `monitoring`. Leave empty to define all rules manually.
+
+  See [Policy Templates](/configuration/templates) for per-template rule details.
+</ParamField>
+
+<ParamField path="spec.dryRun" type="boolean" default="false">
+  When `true`, the controller computes all policies but does **not** apply them to the cluster. Instead, the YAML representation of each generated policy is stored in `status.generatedPolicies` and diffs are recorded in `status.policyDiff`. Useful for reviewing what would be enforced before committing.
+</ParamField>
+
+---
+
+## spec.policy
+
+The `policy` block is **required** and defines the primary namespace-level access model.
+
+<ParamField path="spec.policy.type" type="string" required>
+  Selects the access model. One of `allow` or `deny`.
+
+  - **`allow`** — default-allow posture. All traffic is permitted except from namespaces listed in `deniedNamespaces`.
+  - **`deny`** — default-deny posture. All traffic is blocked except from namespaces listed in `allowedNamespaces`.
+
+  <Tip>
+  Prefer `deny` for production workloads — it follows the principle of least privilege and pairs naturally with `allowedNamespaces` to create an explicit allow-list.
+  </Tip>
+</ParamField>
+
+<ParamField path="spec.policy.allowedNamespaces" type="string[]">
+  List of namespace names that are **allowed** to communicate with pods in this namespace. Only meaningful when `spec.policy.type` is `deny` (allow-list mode). Maximum 128 entries; each name must be ≤ 63 characters (DNS-1123 label).
+
+  <Note>
+  CEL validation prevents the same namespace from appearing in both `allowedNamespaces` and `deniedNamespaces` on the same resource.
+  </Note>
+</ParamField>
+
+<ParamField path="spec.policy.deniedNamespaces" type="string[]">
+  List of namespace names that are **blocked** from communicating with pods in this namespace. Only meaningful when `spec.policy.type` is `allow` (deny-list mode). Maximum 128 entries; each name must be ≤ 63 characters.
+</ParamField>
+
+<ParamField path="spec.policy.podSelector" type="map[string]string">
+  Label selector that restricts the generated policy to a subset of pods within the namespace. Expressed as key/value label pairs. If omitted or empty, the policy targets all pods in the namespace.
+
+  ```yaml
+  podSelector:
+    app: payment-service
+    tier: backend
+  ```
+</ParamField>
+
+---
+
+## spec.globalRules[]
+
+`globalRules` is an optional list (max **256 items**) of port-level traffic rules applied on top of the namespace policy. Each rule is enforced against `0.0.0.0/0` (all IPs) in the specified direction.
+
+<Note>
+CEL validation rule: exactly **one** of `port` or `namedPort` must be present per rule. Setting both or neither is rejected at admission time.
+</Note>
+
+<ParamField path="spec.globalRules[].type" type="string" required>
+  Whether this rule `allow`s or `deny`s the matched traffic. One of `allow` | `deny`.
+</ParamField>
+
+<ParamField path="spec.globalRules[].port" type="integer (int32)">
+  Numeric port number (1–65535). Mutually exclusive with `namedPort`.
+</ParamField>
+
+<ParamField path="spec.globalRules[].namedPort" type="string">
+  Port name as declared in the pod's container spec or Service (e.g., `http`, `grpc`, `https`). Resolved to the actual numeric port at policy-application time. Mutually exclusive with `port`.
+</ParamField>
+
+<ParamField path="spec.globalRules[].protocol" type="string" required>
+  Transport protocol. One of `TCP` | `UDP`.
+</ParamField>
+
+<ParamField path="spec.globalRules[].direction" type="string" required>
+  Traffic direction the rule applies to. One of `ingress` | `egress`.
+</ParamField>
+
+---
+
+## spec.cidrRules[]
+
+`cidrRules` is an optional list (max **256 items**) of CIDR-based rules for external IP ranges such as on-premises databases, external APIs, or monitoring infrastructure.
+
+<ParamField path="spec.cidrRules[].cidr" type="string" required>
+  IP address range in CIDR notation (e.g., `10.0.0.0/8`, `192.168.1.0/24`).
+</ParamField>
+
+<ParamField path="spec.cidrRules[].except" type="string[]">
+  List of sub-ranges to exclude from the main CIDR. Each entry must be a valid CIDR that falls within the parent CIDR (e.g., `10.1.0.0/16` within `10.0.0.0/8`).
+</ParamField>
+
+<ParamField path="spec.cidrRules[].direction" type="string" required>
+  Traffic direction. One of `ingress` | `egress`.
+</ParamField>
+
+---
+
+## Complete example
+
+The following CR exercises every spec field. Copy it as a starting point and remove the fields you don't need.
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: payment-service-policy
+  namespace: production
+spec:
+  # Operation mode
+  mode: enforcing           # "learning" requires spec.duration
+  policyEngine: kubernetes  # kubernetes | cilium | calico
+  templateName: backend-api # zero-trust | web-app | backend-api | database | monitoring
+  dryRun: false             # set true to preview without applying
+
+  # Primary namespace access model
+  policy:
+    type: deny              # deny all; allowedNamespaces is the allow-list
+    allowedNamespaces:
+      - kube-system
+      - monitoring
+      - istio-system
+    podSelector:
+      app: payment-service
+      tier: backend
+
+  # Port-level rules (max 256)
+  globalRules:
+    - type: allow
+      port: 8443
+      protocol: TCP
+      direction: ingress
+    - type: allow
+      namedPort: metrics    # resolves from pod/service spec
+      protocol: TCP
+      direction: ingress
+    - type: allow
+      namedPort: https
+      protocol: TCP
+      direction: egress
+
+  # CIDR-based external rules (max 256)
+  cidrRules:
+    - cidr: "10.0.0.0/8"
+      direction: egress
+    - cidr: "172.16.0.0/12"
+      direction: egress
+    - cidr: "203.0.113.0/24"
+      except:
+        - "203.0.113.128/25"
+      direction: ingress
+```
+
+<Note>
+When `mode: learning` is used, replace `mode: enforcing` with:
+
+```yaml
+mode: learning
+duration: "30m"
+```
+
+The `duration` field is required and must be positive. After the duration elapses the controller transitions to enforcing automatically.
+</Note>
+
+---
+
+## Status fields
+
+The `status` subresource is written by the controller and is read-only from the user's perspective.
+
+<ResponseField name="status.phase" type="string">
+  Current lifecycle phase: `Learning`, `Enforcing`.
+</ResponseField>
+
+<ResponseField name="status.lastAnalyzed" type="string (RFC3339)">
+  Timestamp of the most recent traffic analysis pass.
+</ResponseField>
+
+<ResponseField name="status.observedTraffic" type="TrafficFlow[]">
+  Traffic patterns captured during learning mode, including source/destination namespace and pod, port, and protocol.
+</ResponseField>
+
+<ResponseField name="status.suggestedNamespaces" type="string[]">
+  Namespace names observed communicating with the target during learning. Useful to copy directly into `allowedNamespaces` when switching to `enforcing`.
+</ResponseField>
+
+<ResponseField name="status.suggestedRules" type="SuggestedRule[]">
+  Port/protocol pairs observed during learning mode, each annotated with an observation count. Use these to populate `globalRules` before switching to enforcing.
+</ResponseField>
+
+<ResponseField name="status.generatedPolicies" type="string[]">
+  YAML strings of each generated policy. Only populated when `spec.dryRun: true`.
+</ResponseField>
+
+<ResponseField name="status.policyDiff" type="PolicyDiffEntry[]">
+  Audit log of policy changes. Each entry records `policyName`, `namespace`, `action` (`Created`, `Updated`, or `Unchanged`), and a `timestamp`.
+</ResponseField>
+
+<ResponseField name="status.appliedPoliciesCount" type="integer">
+  Number of NetworkPolicies (or CNI-equivalent resources) currently applied by this generator.
+</ResponseField>

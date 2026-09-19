@@ -1,0 +1,321 @@
+---
+title: "NetworkPolicyGenerator CRD API Reference"
+sidebarTitle: "API Spec"
+description: "Field-by-field reference for the NetworkPolicyGenerator custom resource: spec, policy, globalRules, and cidrRules with types, defaults, and constraints."
+---
+
+The `NetworkPolicyGenerator` custom resource is the single control plane object you interact with to drive the operator. Every field in `spec` maps directly to a validated OpenAPI schema embedded in the CRD — no webhook is required for basic field enforcement. This page documents every field, its type, default value, and any constraints imposed by kubebuilder marker annotations or CEL validation rules embedded in the CRD schema.
+
+## Resource Identity
+
+| Field | Value |
+|-------|-------|
+| `apiVersion` | `security.policy.io/v1` |
+| `kind` | `NetworkPolicyGenerator` |
+| Scope | Namespaced |
+| Plural | `networkpolicygenerators` |
+| Short names | — |
+| Printer columns | `Phase`, `LastAnalyzed`, `Age` |
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: my-generator
+  namespace: my-app
+```
+
+<ParamField path="metadata.name" type="string" required>
+  DNS-1123 subdomain name for this resource. Must be unique within the namespace.
+</ParamField>
+
+<ParamField path="metadata.namespace" type="string" required>
+  Kubernetes namespace where the generator runs. Generated NetworkPolicies are
+  created in this same namespace (or in `deniedNamespaces` for `allow`-type policies).
+</ParamField>
+
+---
+
+## `spec` Fields
+
+<Note>
+  The `spec.policy` object is the only required field. All other `spec` fields have
+  defaults or are optional.
+</Note>
+
+<ParamField path="spec.mode" type="string" default="learning">
+  Operation mode of the generator. Accepted values: `learning`, `enforcing`.
+
+  - **`learning`** — The operator observes live traffic and populates
+    `status.observedTraffic`, `status.suggestedNamespaces`, and `status.suggestedRules`
+    for the duration specified in `spec.duration`. No policies are created.
+  - **`enforcing`** — The operator generates and applies (or dry-runs) NetworkPolicies
+    based on the spec rules and any active template.
+
+  A CEL rule on the spec enforces: `spec.duration` must be set and positive whenever
+  `spec.mode == "learning"`.
+</ParamField>
+
+<ParamField path="spec.duration" type="string (Go duration)">
+  How long the operator stays in learning mode before transitioning to `Enforcing`
+  phase. Required and must be positive when `spec.mode` is `"learning"`.
+
+  Examples: `"5m"`, `"1h"`, `"30s"`. Uses Go's `time.Duration` format.
+
+  | ✅ Valid | ❌ Invalid |
+  |---------|----------|
+  | `"5m"` | `"0s"` (zero) |
+  | `"1h30m"` | `""` (empty) |
+  | `"300s"` | `"-1m"` (negative) |
+</ParamField>
+
+<ParamField path="spec.policyEngine" type="string" default="kubernetes">
+  Which CNI-specific policy object format the operator should emit.
+
+  | Value | Generated resource kind | API group |
+  |-------|------------------------|-----------|
+  | `kubernetes` | `NetworkPolicy` | `networking.k8s.io/v1` |
+  | `cilium` | `CiliumNetworkPolicy` | `cilium.io/v2` |
+  | `calico` | `NetworkPolicy` | `projectcalico.org/v3` |
+
+  Ensure the target CNI's CRDs are installed before switching away from `kubernetes`.
+</ParamField>
+
+<ParamField path="spec.templateName" type="string">
+  Optional name of a built-in policy template to load as a base. User-defined
+  `globalRules` are merged on top of the template — user rules always take
+  precedence.
+
+  | Template | Best for |
+  |----------|----------|
+  | `zero-trust` | Default-deny everything; explicitly permit only known flows |
+  | `web-app` | HTTP/HTTPS ingress + DNS egress |
+  | `backend-api` | Inter-service traffic on common API ports |
+  | `database` | Restrict ingress to trusted app namespaces only |
+  | `monitoring` | Allow Prometheus scrape ports and health endpoints |
+
+  Omit this field (or set to `""`) to start from a blank policy.
+</ParamField>
+
+<ParamField path="spec.dryRun" type="boolean" default="false">
+  When `true` the operator computes policies but **does not apply** them to the cluster.
+  The serialised YAML of what would be applied is stored in `status.generatedPolicies`.
+  Use this mode to preview changes before enforcement.
+</ParamField>
+
+---
+
+## `spec.policy` (required)
+
+The `policy` object defines the primary traffic intent: whether to allow or deny, which namespaces are in scope, and which pods are targeted.
+
+<ParamField path="spec.policy.type" type="string" required>
+  Enumeration: `allow` or `deny`.
+
+  - **`allow`** — default-allow posture; use `deniedNamespaces` to block specific namespaces.
+  - **`deny`** — default-deny posture; use `allowedNamespaces` to permit specific namespaces.
+
+  A CEL validation rule rejects any namespace that appears in both `allowedNamespaces`
+  and `deniedNamespaces`.
+</ParamField>
+
+<ParamField path="spec.policy.allowedNamespaces" type="[]string">
+  Namespaces whose traffic is explicitly **permitted** when `spec.policy.type` is `deny`.
+  Each entry must be a valid DNS-1123 label (max 63 characters). Maximum 128 entries.
+
+  Ignored (but validated for overlap) when `spec.policy.type` is `allow`.
+</ParamField>
+
+<ParamField path="spec.policy.deniedNamespaces" type="[]string">
+  Namespaces whose traffic is explicitly **blocked** when `spec.policy.type` is `allow`.
+  Each entry must be a valid DNS-1123 label (max 63 characters). Maximum 128 entries.
+
+  Ignored (but validated for overlap) when `spec.policy.type` is `deny`.
+</ParamField>
+
+<ParamField path="spec.policy.podSelector" type="map[string]string">
+  Label selector restricting which pods this policy targets. Uses standard Kubernetes
+  label-selector key/value pairs.
+
+  If omitted or empty (`{}`), the policy applies to **all pods** in the namespace.
+
+  ```yaml
+  podSelector:
+    app: payment-service
+    tier: backend
+  ```
+</ParamField>
+
+---
+
+## `spec.globalRules[]` (optional, max 256)
+
+Each entry in `globalRules` represents a single port/protocol/direction traffic rule. A CEL rule on the `GlobalRule` type enforces that **exactly one** of `port` or `namedPort` is present per entry.
+
+<ParamField path="spec.globalRules[].type" type="string" required>
+  Rule disposition: `allow` or `deny`.
+</ParamField>
+
+<ParamField path="spec.globalRules[].port" type="integer (int32)">
+  Numeric port number. Range: `1`–`65535`. Mutually exclusive with `namedPort`.
+  Exactly one of `port` or `namedPort` must be specified per rule.
+</ParamField>
+
+<ParamField path="spec.globalRules[].namedPort" type="string">
+  Named port (e.g., `"http"`, `"grpc"`, `"metrics"`). Mutually exclusive with `port`.
+  The name must match a port name declared on the target Pod's container spec.
+</ParamField>
+
+<ParamField path="spec.globalRules[].protocol" type="string" required>
+  IP protocol: `TCP` or `UDP`. Must be uppercase.
+</ParamField>
+
+<ParamField path="spec.globalRules[].direction" type="string" required>
+  Traffic direction: `ingress` or `egress`.
+
+  <Note>
+    The source types support a `both` value in the task description, but the CRD
+    enum is strictly `ingress` or `egress`. Create two separate rules if you need
+    to permit a port in both directions.
+  </Note>
+</ParamField>
+
+---
+
+## `spec.cidrRules[]` (optional, max 256)
+
+CIDR-based rules for external IP ranges (traffic to/from addresses outside the cluster). These complement `globalRules`, which operate on Kubernetes namespace/pod selectors.
+
+<ParamField path="spec.cidrRules[].cidr" type="string" required>
+  IP address range in CIDR notation. Both IPv4 and IPv6 are accepted.
+
+  Examples: `"10.0.0.0/8"`, `"192.168.1.0/24"`, `"203.0.113.0/24"`.
+
+  The webhook validates this value with `net.ParseCIDR` and rejects malformed strings.
+</ParamField>
+
+<ParamField path="spec.cidrRules[].except" type="[]string">
+  Sub-CIDRs to **exclude** from the parent `cidr`. Each entry is validated as a
+  valid CIDR. Must be strictly within the parent range (enforced by the underlying
+  CNI at policy-application time).
+
+  ```yaml
+  cidr: "203.0.113.0/24"
+  except:
+    - "203.0.113.128/25"   # exclude upper half
+  ```
+</ParamField>
+
+<ParamField path="spec.cidrRules[].direction" type="string" required>
+  Traffic direction: `ingress` or `egress`.
+</ParamField>
+
+---
+
+## Complete Example
+
+The following manifest demonstrates every available field using realistic values from the canonical sample in the source repository.
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: full-features-example
+  namespace: payments
+  labels:
+    app.kubernetes.io/name: network-policy-generator
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  # Operation mode
+  mode: enforcing
+  policyEngine: kubernetes       # kubernetes | cilium | calico
+
+  # Built-in template as a base; user globalRules override template rules
+  templateName: backend-api
+
+  # Dry-run: preview policies without applying them
+  dryRun: false
+
+  # Primary policy configuration
+  policy:
+    type: deny                   # default-deny; only allowedNamespaces pass
+    allowedNamespaces:
+      - kube-system
+      - monitoring
+      - istio-system
+    podSelector:
+      app: payment-service
+      tier: backend
+
+  # Fine-grained port/protocol rules
+  globalRules:
+    - type: allow
+      port: 8443                 # numeric port
+      protocol: TCP
+      direction: ingress
+    - type: allow
+      namedPort: metrics         # named port (mutually exclusive with port)
+      protocol: TCP
+      direction: ingress
+    - type: allow
+      namedPort: https
+      protocol: TCP
+      direction: egress
+
+  # CIDR-based external traffic rules
+  cidrRules:
+    - cidr: "10.0.0.0/8"
+      direction: egress
+    - cidr: "172.16.0.0/12"
+      direction: egress
+    - cidr: "203.0.113.0/24"
+      except:
+        - "203.0.113.128/25"    # exclude upper half of range
+      direction: ingress
+```
+
+---
+
+## Learning-Mode Example
+
+When starting with an unknown application, begin in `learning` mode to let the operator discover traffic patterns before you commit to rules.
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: discovery-run
+  namespace: my-app
+spec:
+  mode: learning
+  duration: "30m"               # observe for 30 minutes
+  policyEngine: kubernetes
+  policy:
+    type: deny                  # intent for eventual enforcing phase
+```
+
+After the duration elapses, inspect `status.suggestedNamespaces` and `status.suggestedRules`, then promote the resource to `enforcing` mode.
+
+---
+
+## Field Constraints Summary
+
+| Field | Type | Required | Default | Constraints |
+|-------|------|----------|---------|-------------|
+| `spec.mode` | string | No | `learning` | enum: `learning`, `enforcing` |
+| `spec.duration` | string | When `mode=learning` | — | Must be positive Go duration |
+| `spec.policyEngine` | string | No | `kubernetes` | enum: `kubernetes`, `cilium`, `calico` |
+| `spec.templateName` | string | No | — | enum: `zero-trust`, `web-app`, `backend-api`, `database`, `monitoring` |
+| `spec.dryRun` | boolean | No | `false` | — |
+| `spec.policy.type` | string | **Yes** | — | enum: `allow`, `deny` |
+| `spec.policy.allowedNamespaces` | []string | No | — | max 128 items, each ≤63 chars |
+| `spec.policy.deniedNamespaces` | []string | No | — | max 128 items, each ≤63 chars |
+| `spec.policy.podSelector` | map[string]string | No | — | valid label key/value pairs |
+| `spec.globalRules[].type` | string | Yes | — | enum: `allow`, `deny` |
+| `spec.globalRules[].port` | int32 | XOR namedPort | — | 1–65535 |
+| `spec.globalRules[].namedPort` | string | XOR port | — | valid pod port name |
+| `spec.globalRules[].protocol` | string | Yes | — | enum: `TCP`, `UDP` |
+| `spec.globalRules[].direction` | string | Yes | — | enum: `ingress`, `egress` |
+| `spec.cidrRules[].cidr` | string | Yes | — | valid CIDR notation |
+| `spec.cidrRules[].except` | []string | No | — | valid CIDR sub-ranges |
+| `spec.cidrRules[].direction` | string | Yes | — | enum: `ingress`, `egress` |

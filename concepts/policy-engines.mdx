@@ -1,0 +1,417 @@
+---
+title: "Supported Policy Engines: Kubernetes, Cilium, Calico"
+sidebarTitle: "Policy Engines"
+description: "The kubernetes, cilium, and calico engines compared: resource types, CNI requirements, namespace selector syntax, deny-rule support, and policy ordering."
+---
+
+Network Policy Generator abstracts CNI-specific policy resources behind a single `spec.policyEngine` field. You pick the engine once per `NetworkPolicyGenerator` CR and the operator generates the correct resource type for your cluster's networking layer. All three engines share the same spec fields (`policy`, `globalRules`, `cidrRules`, `templateName`) and differ only in the Kubernetes resource they produce and the selector syntax they use internally.
+
+## How Engines Are Selected
+
+The `spec.policyEngine` field accepts three values: `kubernetes` (default), `cilium`, and `calico`. The value is validated at the API server level via a CEL enum constraint, so an invalid engine name is rejected before the reconciler runs.
+
+```go
+// From internal/policy/engine.go
+func NewPolicyEngine(engineType string) (PolicyEngine, error) {
+    switch engineType {
+    case EngineKubernetes, "":
+        return NewKubernetesEngine(), nil
+    case EngineCilium:
+        return NewCiliumEngine(), nil
+    case EngineCalico:
+        return NewCalicoEngine(), nil
+    default:
+        return nil, fmt.Errorf("unsupported policy engine: %s", engineType)
+    }
+}
+```
+
+Every engine implements the same two-method `PolicyEngine` interface:
+
+```go
+type PolicyEngine interface {
+    GeneratePolicies(generator *securityv1.NetworkPolicyGenerator) ([]runtime.Object, error)
+    EngineName() string
+}
+```
+
+<Tabs>
+  <Tab title="Kubernetes">
+
+## Kubernetes Engine
+
+The `kubernetes` engine is the default and requires no additional CNI software beyond standard Kubernetes networking. It generates `networking.k8s.io/v1 NetworkPolicy` resources — the built-in policy type available on every conformant Kubernetes cluster.
+
+**Generated resource:**
+
+| Field | Value |
+|-------|-------|
+| `apiVersion` | `networking.k8s.io/v1` |
+| `kind` | `NetworkPolicy` |
+| Engine name | `kubernetes` |
+
+### Minimal Example
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: test-policy-generator
+  namespace: production
+spec:
+  mode: "enforcing"
+  # policyEngine defaults to "kubernetes" — can be omitted
+
+  policy:
+    type: "deny"
+    allowedNamespaces:
+      - "test-ns1"
+      - "test-ns2"
+    deniedNamespaces:
+      - "test-ns3"
+      - "test-ns4"
+
+  globalRules:
+    - type: "allow"
+      port: 80
+      protocol: TCP
+      direction: "ingress"
+    - type: "allow"
+      port: 443
+      protocol: TCP
+      direction: "egress"
+```
+
+### Generated Policy Structure
+
+The engine always sets both `Ingress` and `Egress` in `spec.policyTypes`. Namespace-based rules use the standard `namespaceSelector` with `kubernetes.io/metadata.name` as the key. A DNS egress rule (`UDP/53` to `0.0.0.0/0`) is automatically appended to every policy so that DNS resolution is never blocked by the operator's own policies.
+
+```yaml
+# Example generated NetworkPolicy (kubernetes engine)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: test-policy-generator-generated
+  namespace: production
+  ownerReferences:
+    - apiVersion: security.policy.io/v1
+      kind: NetworkPolicyGenerator
+      name: test-policy-generator
+      controller: true
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: test-ns1
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: test-ns2
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: test-ns1
+    # DNS egress rule appended automatically
+    - ports:
+        - protocol: UDP
+          port: 53
+```
+
+### Engine-Specific Notes
+
+| Feature | Behavior |
+|---------|----------|
+| `spec.policy.podSelector` | When set, uses `matchLabels` to restrict to a pod subset. When empty, `podSelector: {}` applies to all pods in the namespace. |
+| CIDR rules | Mapped to `ipBlock` peers with optional `except` lists. |
+| Global rules | Translated to ingress/egress rules with an `ipBlock` peer. |
+
+  </Tab>
+  <Tab title="Cilium">
+
+## Cilium Engine
+
+The `cilium` engine generates `cilium.io/v2 CiliumNetworkPolicy` resources. It requires Cilium CNI to be installed and running in the cluster. Cilium policies are richer than standard Kubernetes policies: they support L7 awareness, entity-based selectors (`world`, `cluster`, `host`), and separate `ingressDeny` / `egressDeny` rule lists for explicit denial without a default-deny fallback.
+
+<Warning>
+  **CNI Prerequisite:** The `cilium` engine requires [Cilium](https://cilium.io) to be installed and the `cilium.io` CRD group to be registered in the cluster. Applying a `CiliumNetworkPolicy` on a cluster without Cilium will result in a `no kind "CiliumNetworkPolicy" is registered` error.
+</Warning>
+
+**Generated resource:**
+
+| Field | Value |
+|-------|-------|
+| `apiVersion` | `cilium.io/v2` |
+| `kind` | `CiliumNetworkPolicy` |
+| Engine name | `cilium` |
+
+### Minimal Example
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: test-cilium-deny
+  namespace: production
+spec:
+  mode: "enforcing"
+  policyEngine: "cilium"
+
+  policy:
+    type: "deny"
+    allowedNamespaces:
+      - "test-ns3"
+
+  globalRules:
+    - type: "allow"
+      port: 80
+      protocol: TCP
+      direction: "ingress"
+    - type: "allow"
+      port: 443
+      protocol: TCP
+      direction: "egress"
+```
+
+### Endpoint Selectors
+
+Cilium uses `endpointSelector` (not `podSelector`) to select which endpoints a policy applies to. The operator maps `spec.policy.podSelector` labels into a `CiliumEndpointSelector.matchLabels` block:
+
+```yaml
+spec:
+  endpointSelector:
+    matchLabels:
+      app: my-service   # from spec.policy.podSelector
+```
+
+When `spec.policy.podSelector` is empty, an empty `endpointSelector: {}` is used, which matches all endpoints in the namespace.
+
+### Namespace-Based Peer Selection
+
+Cilium identifies namespaces via the label key `k8s:io.kubernetes.pod.namespace` on endpoint selectors (not `kubernetes.io/metadata.name` as in the Kubernetes engine):
+
+```yaml
+ingress:
+  - fromEndpoints:
+      - matchLabels:
+          k8s:io.kubernetes.pod.namespace: test-ns3
+```
+
+### Deny Rules vs. Allow Rules
+
+For `spec.policy.type: allow` (denylist semantics), the Cilium engine populates `spec.ingressDeny` and `spec.egressDeny` instead of the standard `ingress`/`egress` lists. This leverages Cilium's native deny policy capability for more explicit control without requiring a blanket default-deny.
+
+### Global Rules and Entities
+
+Global rules with `direction: ingress` are translated to `fromEntities: ["world"]` rules with `toPorts`. The `world` entity represents all traffic from outside the cluster, matching Cilium's entity model:
+
+```yaml
+ingress:
+  - fromEntities:
+      - world
+    toPorts:
+      - ports:
+          - port: "80"
+            protocol: TCP
+```
+
+### DNS Egress Rule
+
+Cilium DNS egress is expressed via endpoint selectors targeting the `kube-dns` pod in `kube-system`, with both UDP and TCP port 53 allowed:
+
+```yaml
+egress:
+  - toEndpoints:
+      - matchLabels:
+          k8s:io.kubernetes.pod.namespace: kube-system
+          k8s:k8s-app: kube-dns
+    toPorts:
+      - ports:
+          - port: "53"
+            protocol: UDP
+          - port: "53"
+            protocol: TCP
+```
+
+  </Tab>
+  <Tab title="Calico">
+
+## Calico Engine
+
+The `calico` engine generates `crd.projectcalico.org/v1 NetworkPolicy` resources. It requires Calico CNI to be installed. Calico policies use a string-based selector expression language (not label maps) and support an ordering system that controls precedence when multiple policies match the same workload.
+
+<Warning>
+  **CNI Prerequisite:** The `calico` engine requires [Calico](https://www.tigera.io/project-calico/) to be installed and the `crd.projectcalico.org` CRD group to be registered in the cluster. Applying a Calico `NetworkPolicy` on a cluster without Calico will result in a resource registration error.
+</Warning>
+
+**Generated resource:**
+
+| Field | Value |
+|-------|-------|
+| `apiVersion` | `crd.projectcalico.org/v1` |
+| `kind` | `NetworkPolicy` |
+| Engine name | `calico` |
+
+### Minimal Example
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: test-calico-deny
+  namespace: production
+spec:
+  mode: "enforcing"
+  policyEngine: "calico"
+
+  policy:
+    type: "deny"
+    allowedNamespaces:
+      - "test-ns3"
+
+  globalRules:
+    - type: "allow"
+      port: 80
+      protocol: TCP
+      direction: "ingress"
+    - type: "allow"
+      port: 443
+      protocol: TCP
+      direction: "egress"
+```
+
+### Calico Selector Syntax
+
+Calico uses expression strings rather than label maps for endpoint and namespace selection. The operator builds these expressions automatically from the CR spec:
+
+**Pod selector** (from `spec.policy.podSelector`):
+
+```text
+# Single label:   app == 'my-service'
+# Multiple labels: app == 'my-service' && tier == 'backend'
+```
+
+When `spec.policy.podSelector` is empty, the selector defaults to `all()`, which matches every pod in the namespace.
+
+**Namespace selector** (from `allowedNamespaces` / `deniedNamespaces`):
+
+```text
+# Single namespace:
+projectcalico.org/name == 'test-ns3'
+
+# Multiple namespaces:
+projectcalico.org/name in { 'test-ns1', 'test-ns2' }
+```
+
+### Policy Ordering
+
+Every Calico policy generated by the operator is assigned `spec.order: 100` (the `CalicoDefaultOrder` constant). Lower numbers mean higher precedence in Calico's evaluation order. If you have other Calico policies in the namespace, set them to a different order value to control which policy takes effect first.
+
+### Rule Structure
+
+Calico rules use `source` and `destination` match criteria with explicit `action` fields (`Allow` or `Deny`):
+
+```yaml
+spec:
+  order: 100
+  selector: all()
+  types:
+    - Ingress
+    - Egress
+  ingress:
+    - action: Allow
+      source:
+        namespaceSelector: "projectcalico.org/name == 'test-ns3'"
+  egress:
+    - action: Allow
+      destination:
+        namespaceSelector: "projectcalico.org/name == 'test-ns3'"
+```
+
+For `spec.policy.type: allow` (denylist semantics), rules use `action: Deny` instead of `action: Allow`.
+
+### DNS Egress Rule
+
+Calico's DNS egress rule targets the `kube-dns` pod in `kube-system` using combined namespace and endpoint selectors:
+
+```yaml
+egress:
+  - action: Allow
+    protocol: UDP
+    destination:
+      namespaceSelector: "projectcalico.org/name == 'kube-system'"
+      selector: "k8s-app == 'kube-dns'"
+      ports:
+        - 53
+```
+
+  </Tab>
+</Tabs>
+
+## Engine Comparison
+
+<CardGroup cols={3}>
+  <Card title="kubernetes" icon="dharmachakra">
+    **`networking.k8s.io/v1 NetworkPolicy`**
+
+    Works on any Kubernetes cluster. Uses `namespaceSelector` with `kubernetes.io/metadata.name`. No CNI dependency.
+  </Card>
+  <Card title="cilium" icon="shield-halved">
+    **`cilium.io/v2 CiliumNetworkPolicy`**
+
+    Requires Cilium CNI. Uses endpoint selectors, entity-based peers (`world`), and separate `ingressDeny`/`egressDeny` lists.
+  </Card>
+  <Card title="calico" icon="shield">
+    **`crd.projectcalico.org/v1 NetworkPolicy`**
+
+    Requires Calico CNI. Uses Calico expression selectors, `action` fields, and `spec.order` for policy precedence.
+  </Card>
+</CardGroup>
+
+| Feature | `kubernetes` | `cilium` | `calico` |
+|---------|-------------|----------|---------|
+| CNI required | Any | Cilium | Calico |
+| Generated kind | `NetworkPolicy` | `CiliumNetworkPolicy` | `NetworkPolicy` |
+| API group | `networking.k8s.io/v1` | `cilium.io/v2` | `crd.projectcalico.org/v1` |
+| Namespace selector style | `matchLabels` map | `matchLabels` map | Expression string |
+| Pod selector style | `matchLabels` map | `matchLabels` map | Expression string |
+| Explicit deny rules | ❌ (default-deny only) | ✅ (`ingressDeny`/`egressDeny`) | ✅ (`action: Deny`) |
+| Policy ordering | ❌ | ❌ | ✅ (`spec.order`) |
+| Entity-based peers | ❌ | ✅ (`world`, `cluster`) | ❌ |
+
+<Accordion title="Switching Engines on an Existing CR">
+  You can change `spec.policyEngine` on a live `NetworkPolicyGenerator` at any time. The operator will generate and apply new policies in the new engine format on the next reconcile. However, it **will not** automatically delete the old policies created by the previous engine — those use a different API group and are not tracked by the new engine.
+
+  To cleanly switch engines, delete the old generated policies manually before or after patching the CR:
+
+  ```bash
+  # Example: switching from kubernetes to cilium
+  # 1. Delete the old generated NetworkPolicy
+  kubectl delete networkpolicy my-generator-generated -n production
+
+  # 2. Patch the CR to use the new engine
+  kubectl patch networkpolicygenerator my-generator \
+    --type=merge -p '{"spec":{"policyEngine":"cilium"}}'
+  ```
+
+  The operator will recreate the policy in the new format on the next reconcile.
+</Accordion>
+
+<Accordion title="Using Named Ports with All Engines">
+  All three engines support named ports in `spec.globalRules` via `spec.globalRules[*].namedPort`. Named ports reference container port names defined in the pod spec rather than numeric port numbers.
+
+  ```yaml
+  globalRules:
+    - type: "allow"
+      namedPort: "https"   # references a named containerPort
+      protocol: TCP
+      direction: "egress"
+  ```
+
+  Note that exactly one of `port` or `namedPort` must be set per rule — the CRD enforces this with a CEL validation rule.
+</Accordion>

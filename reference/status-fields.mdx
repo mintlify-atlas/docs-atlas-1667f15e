@@ -1,0 +1,307 @@
+---
+title: "NetworkPolicyGenerator Status Subresource Reference"
+sidebarTitle: "Status Fields"
+description: "Every status field on NetworkPolicyGenerator: phase lifecycle, observed traffic, suggested rules, and policy diff entries with kubectl inspection commands."
+---
+
+The `status` subresource on `NetworkPolicyGenerator` is the operator's window into what is actually happening in the cluster. It is written exclusively by the reconciler — you should never set these fields manually. Understanding the status fields helps you track the learning phase, validate suggested rules before promoting to enforcing mode, inspect dry-run output, and audit which policies were created or updated on the last reconcile cycle. All fields are optional and may be absent until the operator has performed its first successful reconcile.
+
+## Quick Inspection Commands
+
+```bash
+# Full status block for a named generator
+kubectl get networkpolicygenerator my-generator -n my-app -o jsonpath='{.status}' | jq .
+
+# Watch the phase column in real-time
+kubectl get networkpolicygenerator -n my-app -w
+
+# Describe with events
+kubectl describe networkpolicygenerator my-generator -n my-app
+```
+
+---
+
+## Status Fields
+
+<ResponseField name="status.phase" type="string">
+  Current lifecycle phase of the generator. Updated by the reconciler at the start
+  of every reconcile loop.
+
+  | Value | Meaning |
+  |-------|---------|
+  | `Learning` | The operator is collecting traffic observations within the configured `spec.duration` window |
+  | `Enforcing` | The operator is generating and applying (or dry-running) NetworkPolicies |
+  | `Error` | The last reconcile loop encountered a terminal error; see Events for details |
+
+  The `Phase` column is also surfaced in `kubectl get` output via the printer column
+  annotation on the CRD.
+
+  ```bash
+  kubectl get networkpolicygenerator -n my-app
+  # NAME           PHASE       LASTANALYZED             AGE
+  # my-generator   Learning    2024-11-01T12:00:00Z     5m
+  ```
+
+  ```bash
+  # Filter only generators in Error phase
+  kubectl get networkpolicygenerator -A -o json | \
+    jq '.items[] | select(.status.phase=="Error") | .metadata.name'
+  ```
+</ResponseField>
+
+<ResponseField name="status.lastAnalyzed" type="string (RFC3339 timestamp)">
+  Timestamp of the most recent traffic analysis pass, in RFC 3339 / ISO 8601 format
+  (e.g., `"2024-11-01T12:30:00Z"`). Updated at the end of each successful reconcile
+  cycle.
+
+  Use this field to confirm the operator is actively reconciling, or to determine
+  how stale the observed traffic data is.
+
+  ```bash
+  kubectl get networkpolicygenerator my-generator -n my-app \
+    -o jsonpath='{.status.lastAnalyzed}'
+  ```
+</ResponseField>
+
+<ResponseField name="status.appliedPoliciesCount" type="integer">
+  The total number of NetworkPolicy (or CiliumNetworkPolicy / Calico NetworkPolicy)
+  objects that are currently owned and actively managed by this generator. Updated
+  after every successful enforcing-mode reconcile.
+
+  A value of `0` in `Enforcing` phase may indicate that `spec.dryRun: true` is set,
+  or that no rules matched any pods.
+
+  ```bash
+  kubectl get networkpolicygenerator my-generator -n my-app \
+    -o jsonpath='{.status.appliedPoliciesCount}'
+  ```
+</ResponseField>
+
+---
+
+## Learning-Mode Status Fields
+
+The following three fields are populated **only** during `Learning` phase. They represent the operator's traffic observations and become the source of truth you use when writing your `spec.policy`, `spec.policy.allowedNamespaces`, and `spec.globalRules` before switching to `enforcing` mode.
+
+<ResponseField name="status.observedTraffic" type="TrafficFlow[]">
+  List of individual traffic flows recorded by the monitor during the learning window.
+  Each entry is a `TrafficFlow` object.
+
+  <Expandable title="TrafficFlow object fields">
+    <ResponseField name="sourceNamespace" type="string">
+      Kubernetes namespace of the traffic source pod.
+    </ResponseField>
+    <ResponseField name="sourcePod" type="string">
+      Name of the source pod.
+    </ResponseField>
+    <ResponseField name="destNamespace" type="string">
+      Kubernetes namespace of the destination pod.
+    </ResponseField>
+    <ResponseField name="destPod" type="string">
+      Name of the destination pod.
+    </ResponseField>
+    <ResponseField name="protocol" type="string">
+      IP protocol observed: `TCP` or `UDP`.
+    </ResponseField>
+    <ResponseField name="port" type="integer (int32)">
+      Destination port number of the observed flow.
+    </ResponseField>
+  </Expandable>
+
+  ```bash
+  # List all observed traffic flows as a table
+  kubectl get networkpolicygenerator my-generator -n my-app \
+    -o jsonpath='{.status.observedTraffic}' | jq '.[] | {src: .sourceNamespace, dst: .destNamespace, port: .port, proto: .protocol}'
+  ```
+
+  ```json
+  [
+    {
+      "sourceNamespace": "frontend",
+      "sourcePod": "web-6d8f7b9c4-xkzp2",
+      "destNamespace": "backend",
+      "destPod": "api-5f9c8d7b6-mnjq1",
+      "protocol": "TCP",
+      "port": 8080
+    }
+  ]
+  ```
+</ResponseField>
+
+<ResponseField name="status.suggestedNamespaces" type="string[]">
+  Deduplicated list of namespace names observed as traffic sources or destinations
+  during learning mode. Intended to be copied directly into `spec.policy.allowedNamespaces`
+  when transitioning from `deny`-type learning to enforcing.
+
+  ```bash
+  kubectl get networkpolicygenerator my-generator -n my-app \
+    -o jsonpath='{.status.suggestedNamespaces[*]}'
+  # kube-system monitoring frontend
+  ```
+
+  <Tip>
+    Use this list as the starting point for `allowedNamespaces` when promoting
+    a `deny`-type generator to enforcing mode. Remove any namespaces you do not
+    want to permit.
+  </Tip>
+</ResponseField>
+
+<ResponseField name="status.suggestedRules" type="SuggestedRule[]">
+  Port/protocol/direction tuples observed frequently enough during learning to
+  warrant a corresponding `globalRule`. Each entry includes an observation `count`
+  so you can prioritise high-traffic rules.
+
+  <Expandable title="SuggestedRule object fields">
+    <ResponseField name="port" type="integer (int32)" required>
+      Destination port number observed.
+    </ResponseField>
+    <ResponseField name="protocol" type="string" required>
+      Protocol observed: `TCP` or `UDP`.
+    </ResponseField>
+    <ResponseField name="direction" type="string" required>
+      Traffic direction: `ingress` or `egress`.
+    </ResponseField>
+    <ResponseField name="count" type="integer" required>
+      Number of times this port/protocol/direction combination was observed
+      during the learning window.
+    </ResponseField>
+  </Expandable>
+
+  ```bash
+  # Show suggested rules sorted by observation count
+  kubectl get networkpolicygenerator my-generator -n my-app \
+    -o jsonpath='{.status.suggestedRules}' | \
+    jq 'sort_by(-.count)[] | {port, protocol, direction, count}'
+  ```
+
+  ```json
+  [
+    { "port": 8080, "protocol": "TCP", "direction": "ingress", "count": 142 },
+    { "port": 5432, "protocol": "TCP", "direction": "egress",  "count": 87  },
+    { "port": 53,   "protocol": "UDP", "direction": "egress",  "count": 56  }
+  ]
+  ```
+
+  Copy the high-count rules into `spec.globalRules` before switching to `enforcing` mode:
+
+  ```yaml
+  globalRules:
+    - type: allow
+      port: 8080
+      protocol: TCP
+      direction: ingress
+    - type: allow
+      port: 5432
+      protocol: TCP
+      direction: egress
+    - type: allow
+      port: 53
+      protocol: UDP
+      direction: egress
+  ```
+</ResponseField>
+
+---
+
+## Enforcing-Mode Status Fields
+
+<ResponseField name="status.generatedPolicies" type="string[]">
+  Present **only when `spec.dryRun: true`**. Each element is the YAML-serialised
+  representation of a NetworkPolicy (or CiliumNetworkPolicy / Calico NetworkPolicy)
+  that *would have* been applied to the cluster. Policies are not created in the
+  cluster when this field is populated.
+
+  ```bash
+  # Print the first dry-run policy
+  kubectl get networkpolicygenerator my-generator -n my-app \
+    -o jsonpath='{.status.generatedPolicies[0]}'
+  ```
+
+  <Note>
+    When `spec.dryRun` is switched from `true` to `false`, the operator clears
+    this field and begins applying the policies to the cluster. The `policyDiff`
+    field will then record the `Created` actions.
+  </Note>
+</ResponseField>
+
+<ResponseField name="status.policyDiff" type="PolicyDiffEntry[]">
+  Audit log of policy changes made by the most recent enforcing-mode reconcile.
+  Each entry records the name, namespace, action taken, and timestamp of a single
+  policy-level change. Useful for confirming that a spec change propagated correctly.
+
+  <Expandable title="PolicyDiffEntry object fields">
+    <ResponseField name="policyName" type="string" required>
+      Name of the NetworkPolicy that was affected.
+    </ResponseField>
+    <ResponseField name="namespace" type="string" required>
+      Namespace of the affected NetworkPolicy.
+    </ResponseField>
+    <ResponseField name="action" type="string" required>
+      Type of change: `Created`, `Updated`, or `Unchanged`.
+    </ResponseField>
+    <ResponseField name="timestamp" type="string (RFC3339)" required>
+      When the change was detected or applied, in RFC 3339 format.
+    </ResponseField>
+  </Expandable>
+
+  ```bash
+  # Show all policy diff entries
+  kubectl get networkpolicygenerator my-generator -n my-app \
+    -o jsonpath='{.status.policyDiff}' | \
+    jq '.[] | {name: .policyName, ns: .namespace, action, time: .timestamp}'
+  ```
+
+  ```json
+  [
+    {
+      "policyName": "my-generator-allow-ingress",
+      "namespace": "my-app",
+      "action": "Created",
+      "timestamp": "2024-11-01T13:00:05Z"
+    },
+    {
+      "policyName": "my-generator-deny-egress",
+      "namespace": "my-app",
+      "action": "Updated",
+      "timestamp": "2024-11-01T13:00:05Z"
+    }
+  ]
+  ```
+</ResponseField>
+
+---
+
+## Status Lifecycle Diagram
+
+```text
+            spec.mode=learning
+                    │
+                    ▼
+             ┌─────────────┐   duration elapsed   ┌──────────────┐
+             │  Learning   │─────────────────────▶│  Enforcing   │
+             └─────────────┘                       └──────────────┘
+                    │                                     │
+             observedTraffic                       appliedPoliciesCount
+             suggestedNamespaces                   policyDiff
+             suggestedRules                        generatedPolicies (dryRun)
+                    │                                     │
+                    └──────────────┬──────────────────────┘
+                                   │
+                              reconcile error
+                                   │
+                                   ▼
+                              ┌─────────┐
+                              │  Error  │
+                              └─────────┘
+```
+
+## Watching Status Events
+
+Kubernetes events tied to a generator carry additional context on state transitions and errors. Events are emitted by the reconciler using the `network-policy-generator` event source:
+
+```bash
+# View events scoped to a specific generator
+kubectl get events -n my-app \
+  --field-selector involvedObject.name=my-generator \
+  --sort-by='.lastTimestamp'
+```

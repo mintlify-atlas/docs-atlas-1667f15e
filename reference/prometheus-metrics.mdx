@@ -1,0 +1,344 @@
+---
+title: "Prometheus Metrics Exported by the Operator"
+sidebarTitle: "Prometheus Metrics"
+description: "Seven Prometheus metrics from network-policy-generator: labels, types, PromQL queries, and instructions to enable Prometheus scraping via ServiceMonitor."
+---
+
+The Network Policy Generator operator registers seven Prometheus metrics through controller-runtime's shared metrics registry. These metrics give you observability into reconcile throughput, policy operation rates, active generator counts, reconcile latency, dry-run activity, and validation error rates — everything you need to build SLO dashboards and alert on operator health. The metrics endpoint is served over HTTPS on port `8443` by default and requires Kubernetes bearer-token authentication; see the [scraping configuration](#enabling-prometheus-scraping) section for setup details.
+
+---
+
+## Metrics Reference
+
+### `npg_reconcile_total`
+
+| Property | Value |
+|----------|-------|
+| **Type** | Counter |
+| **Labels** | `result` — `"success"` or `"error"` |
+| **Help** | Total number of reconciliations by result |
+
+Incremented once per reconcile loop completion. The `result` label distinguishes
+successful reconciliations from those that returned an error and were requeued.
+
+**Example PromQL queries:**
+
+```promql
+# Total reconcile rate (all results) over 5 minutes
+rate(npg_reconcile_total[5m])
+
+# Error ratio — fraction of reconciles that failed
+rate(npg_reconcile_total{result="error"}[5m])
+  /
+rate(npg_reconcile_total[5m])
+
+# Alert: error rate above 5% for 10 minutes
+(rate(npg_reconcile_total{result="error"}[5m]) /
+ rate(npg_reconcile_total[5m])) > 0.05
+```
+
+---
+
+### `npg_policies_applied`
+
+| Property | Value |
+|----------|-------|
+| **Type** | Gauge |
+| **Labels** | `name` — generator name; `namespace` — generator namespace; `engine` — policy engine (`kubernetes`/`cilium`/`calico`) |
+| **Help** | Number of applied network policies per generator |
+
+Tracks the live count of NetworkPolicy objects owned by each generator. Set to the
+value of `status.appliedPoliciesCount` after each successful enforcing-mode reconcile.
+Falls to `0` for generators in `dryRun` mode.
+
+**Example PromQL queries:**
+
+```promql
+# Current policy count for a specific generator
+npg_policies_applied{name="payment-service", namespace="payments"}
+
+# Total policies across all generators using the Cilium engine
+sum(npg_policies_applied{engine="cilium"})
+
+# Alert: generator drops to zero policies unexpectedly
+npg_policies_applied{engine!=""} == 0
+```
+
+---
+
+### `npg_policy_operations_total`
+
+| Property | Value |
+|----------|-------|
+| **Type** | Counter |
+| **Labels** | `action` — `"Created"`, `"Updated"`, or `"Deleted"` |
+| **Help** | Total number of policy operations by action |
+
+Incremented each time the reconciler creates, updates, or deletes a NetworkPolicy
+object. Correlates with entries in `status.policyDiff`.
+
+**Example PromQL queries:**
+
+```promql
+# Rate of policy creates over the past 15 minutes
+rate(npg_policy_operations_total{action="Created"}[15m])
+
+# Ratio of updates to creates — high ratio suggests spec churn
+rate(npg_policy_operations_total{action="Updated"}[5m])
+  /
+rate(npg_policy_operations_total{action="Created"}[5m])
+
+# Total deletes in the last hour
+increase(npg_policy_operations_total{action="Deleted"}[1h])
+```
+
+---
+
+### `npg_generators_active`
+
+| Property | Value |
+|----------|-------|
+| **Type** | Gauge |
+| **Labels** | `phase` — `"Learning"` or `"Enforcing"` |
+| **Help** | Number of active generators by phase |
+
+Reflects the number of `NetworkPolicyGenerator` resources currently in each phase.
+Useful for capacity planning and detecting stuck generators.
+
+**Example PromQL queries:**
+
+```promql
+# Generators currently in Learning phase
+npg_generators_active{phase="Learning"}
+
+# Total active generators across all phases
+sum(npg_generators_active)
+
+# Alert: any generator stuck in Learning for more than 2 hours
+# (combine with Kubernetes label query or custom recording rule)
+npg_generators_active{phase="Learning"} > 0
+```
+
+---
+
+### `npg_reconcile_duration_seconds`
+
+| Property | Value |
+|----------|-------|
+| **Type** | Histogram |
+| **Labels** | `mode` — `"learning"` or `"enforcing"` |
+| **Buckets** | Prometheus default buckets (`.005`, `.01`, `.025`, `.05`, `.1`, `.25`, `.5`, `1`, `2.5`, `5`, `10`) |
+| **Help** | Duration of reconciliation in seconds |
+
+Measures end-to-end wall-clock time for each reconcile loop, split by mode. Learning-mode reconciles are typically fast (traffic snapshot collection). Enforcing-mode reconciles include policy generation and Kubernetes API writes.
+
+**Example PromQL queries:**
+
+```promql
+# 99th-percentile reconcile latency in enforcing mode (5-minute window)
+histogram_quantile(0.99,
+  rate(npg_reconcile_duration_seconds_bucket{mode="enforcing"}[5m])
+)
+
+# Average reconcile duration by mode
+rate(npg_reconcile_duration_seconds_sum[5m])
+  /
+rate(npg_reconcile_duration_seconds_count[5m])
+
+# Alert: p99 enforcing reconcile exceeds 5 seconds
+histogram_quantile(0.99,
+  rate(npg_reconcile_duration_seconds_bucket{mode="enforcing"}[5m])
+) > 5
+```
+
+---
+
+### `npg_dry_run_total`
+
+| Property | Value |
+|----------|-------|
+| **Type** | Counter |
+| **Labels** | _(none)_ |
+| **Help** | Total number of dry-run executions |
+
+Incremented each time a generator with `spec.dryRun: true` completes a reconcile cycle. A non-zero and steadily increasing value confirms that dry-run generators are being processed. If this counter is flat while you expect dry-run activity, check that the generator's `spec.mode` is `enforcing` (dry-run only runs in enforcing mode).
+
+**Example PromQL queries:**
+
+```promql
+# Rate of dry-run executions over 10 minutes
+rate(npg_dry_run_total[10m])
+
+# Total dry-runs since operator start
+npg_dry_run_total
+```
+
+---
+
+### `npg_validation_errors_total`
+
+| Property | Value |
+|----------|-------|
+| **Type** | Counter |
+| **Labels** | `type` — `"webhook"` or `"reconcile"` |
+| **Help** | Total number of validation errors by type |
+
+Incremented when validation fails — either at webhook admission time (`type="webhook"`)
+or during the reconcile loop when a generated policy fails internal validation
+(`type="reconcile"`).
+
+**Example PromQL queries:**
+
+```promql
+# Rate of validation errors over 5 minutes by type
+rate(npg_validation_errors_total[5m])
+
+# Alert: any webhook validation errors in the last 15 minutes
+increase(npg_validation_errors_total{type="webhook"}[15m]) > 0
+
+# Ratio of reconcile validation errors to total reconciles
+rate(npg_validation_errors_total{type="reconcile"}[5m])
+  /
+rate(npg_reconcile_total[5m])
+```
+
+---
+
+## Enabling Prometheus Scraping
+
+### Using a ServiceMonitor (recommended)
+
+The operator ships a `ServiceMonitor` manifest at `config/prometheus/monitor.yaml`. When Prometheus Operator is installed in the cluster, apply it to begin scraping automatically:
+
+```bash
+kubectl apply -f config/prometheus/monitor.yaml
+```
+
+The `ServiceMonitor` selects the operator's Service via the `control-plane: controller-manager` label and scrapes the `/metrics` path on the `https` named port using bearer-token auth:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: controller-manager-metrics-monitor
+  namespace: network-policy-generator-system
+spec:
+  endpoints:
+    - path: /metrics
+      port: https
+      scheme: https
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        insecureSkipVerify: true   # replace with caFile in production
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+```
+
+<Warning>
+  The default `ServiceMonitor` uses `insecureSkipVerify: true` for convenience.
+  In production, replace this with explicit CA, cert, and key file references to
+  validate the operator's TLS certificate and prevent man-in-the-middle attacks
+  on the metrics path.
+</Warning>
+
+### Using the Helm Chart
+
+Enable the `ServiceMonitor` and metrics Service via Helm values:
+
+```yaml
+metrics:
+  enabled: true
+  port: 8443
+```
+
+```bash
+helm upgrade --install network-policy-generator \
+  oci://ghcr.io/somaz94/charts/network-policy-generator \
+  --namespace network-policy-generator-system \
+  --set metrics.enabled=true
+```
+
+### Metrics Endpoint Details
+
+| Property | Value |
+|----------|-------|
+| Port | `8443` (configurable via `--metrics-bind-address`) |
+| Protocol | HTTPS (default; `--metrics-secure=true`) |
+| Path | `/metrics` |
+| Authentication | Kubernetes bearer token (`Authorization: Bearer <token>`) |
+| Authorization | RBAC via `SubjectAccessReview` filter |
+
+---
+
+## Port-Forward for Local Inspection
+
+During development or debugging, port-forward directly to the operator pod to scrape metrics without a Prometheus instance:
+
+```bash
+# Find the operator pod
+kubectl get pods -n network-policy-generator-system -l control-plane=controller-manager
+
+# Port-forward to the metrics port
+kubectl port-forward -n network-policy-generator-system \
+  deployment/network-policy-generator-controller-manager \
+  8443:8443
+```
+
+Then fetch metrics using a service account token:
+
+```bash
+# Get a token for the operator's service account
+TOKEN=$(kubectl create token network-policy-generator-controller-manager \
+  -n network-policy-generator-system)
+
+# Fetch all metrics (skip TLS verification for self-signed certs)
+curl -sk -H "Authorization: Bearer $TOKEN" \
+  https://localhost:8443/metrics | grep ^npg_
+```
+
+Example output:
+
+```text
+# HELP npg_dry_run_total Total number of dry-run executions
+# TYPE npg_dry_run_total counter
+npg_dry_run_total 3
+# HELP npg_generators_active Number of active generators by phase
+# TYPE npg_generators_active gauge
+npg_generators_active{phase="Enforcing"} 2
+npg_generators_active{phase="Learning"} 1
+# HELP npg_policies_applied Number of applied network policies per generator
+# TYPE npg_policies_applied gauge
+npg_policies_applied{engine="kubernetes",name="payment-service",namespace="payments"} 4
+# HELP npg_policy_operations_total Total number of policy operations by action
+# TYPE npg_policy_operations_total counter
+npg_policy_operations_total{action="Created"} 12
+npg_policy_operations_total{action="Updated"} 3
+npg_policy_operations_total{action="Deleted"} 1
+# HELP npg_reconcile_duration_seconds Duration of reconciliation in seconds
+# TYPE npg_reconcile_duration_seconds histogram
+npg_reconcile_duration_seconds_bucket{mode="enforcing",le="0.005"} 8
+npg_reconcile_duration_seconds_bucket{mode="enforcing",le="0.01"} 14
+# HELP npg_reconcile_total Total number of reconciliations by result
+# TYPE npg_reconcile_total counter
+npg_reconcile_total{result="error"} 1
+npg_reconcile_total{result="success"} 47
+# HELP npg_validation_errors_total Total number of validation errors by type
+# TYPE npg_validation_errors_total counter
+npg_validation_errors_total{type="reconcile"} 1
+npg_validation_errors_total{type="webhook"} 0
+```
+
+---
+
+## Metrics Summary Table
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `npg_reconcile_total` | Counter | `result` | Total reconcile calls by outcome |
+| `npg_policies_applied` | Gauge | `name`, `namespace`, `engine` | Currently active policies per generator |
+| `npg_policy_operations_total` | Counter | `action` | Policy create/update/delete operations |
+| `npg_generators_active` | Gauge | `phase` | Generators currently in each phase |
+| `npg_reconcile_duration_seconds` | Histogram | `mode` | Reconcile loop duration in seconds |
+| `npg_dry_run_total` | Counter | _(none)_ | Dry-run reconcile executions |
+| `npg_validation_errors_total` | Counter | `type` | Validation errors by source |

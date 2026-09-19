@@ -1,0 +1,310 @@
+---
+title: "Learning and Enforcing Modes: A Complete Deep Dive"
+sidebarTitle: "Operating Modes"
+description: "Learning mode observes traffic and builds policy suggestions. Enforcing applies policies, supports dry-run preview, and self-heals via periodic requeue."
+---
+
+Network Policy Generator is designed around a two-phase lifecycle: first it **learns** what traffic flows naturally through your namespace, then it **enforces** policies that codify those patterns. This separation lets you deploy the operator safely in production, inspect what it intends to do, and only commit to enforcement once you're confident the generated rules are correct.
+
+<Tabs>
+  <Tab title="Learning Mode">
+
+## Learning Mode
+
+Learning mode is the safe-observation phase. The operator watches your namespace, collects traffic evidence, and builds a set of suggestions — but writes **zero** network policies. Use it whenever you're deploying the operator for the first time, rolling it out to a new namespace, or auditing an existing workload.
+
+### How It Works
+
+When you create a `NetworkPolicyGenerator` with `spec.mode: learning`, the reconciler:
+
+1. Records `status.lastAnalyzed` as the start timestamp and sets `status.phase: Learning`.
+2. Requeues itself for `spec.duration` in the future.
+3. On requeue, checks whether `spec.duration` has elapsed since `status.lastAnalyzed`.
+4. Once elapsed, calls `buildLearningSuggestions` to populate `status.suggestedNamespaces` and `status.suggestedRules`.
+5. Automatically transitions to enforcing mode by writing `spec.mode: enforcing`.
+
+The `Monitor` and `Collector` run in the background throughout the learning window, sampling pod container ports and environment-variable-derived service endpoints every 30 seconds.
+
+### Required Fields
+
+| Field | Description |
+|-------|-------------|
+| `spec.mode` | Set to `"learning"` |
+| `spec.duration` | How long to observe traffic (e.g., `"5m"`, `"1h"`). Must be a positive duration. |
+| `spec.policy.type` | Either `"deny"` (default, allowlist model) or `"allow"` (denylist model). |
+
+<Note>
+  `spec.duration` is enforced by a CEL validation rule in the CRD. Submitting a `learning` mode CR without a positive duration will be rejected by the API server before the reconciler even runs.
+</Note>
+
+### Example: Learning CR
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: my-app-learning
+  namespace: production
+spec:
+  mode: "learning"
+  duration: "10m"
+
+  policy:
+    type: "deny"
+    allowedNamespaces:
+      - "monitoring"
+      - "ingress-nginx"
+
+  globalRules:
+    - type: "allow"
+      port: 8080
+      protocol: TCP
+      direction: "ingress"
+    - type: "allow"
+      port: 443
+      protocol: TCP
+      direction: "egress"
+```
+
+Apply it and watch the status update in real time:
+
+```bash
+kubectl apply -f my-app-learning.yaml
+
+# Watch the phase and suggestions populate
+kubectl get networkpolicygenerator my-app-learning -w
+
+# After the duration elapses, inspect suggestions
+kubectl get networkpolicygenerator my-app-learning \
+  -o jsonpath='{.status.suggestedNamespaces}' | jq .
+
+kubectl get networkpolicygenerator my-app-learning \
+  -o jsonpath='{.status.suggestedRules}' | jq .
+```
+
+### Understanding the Suggestions
+
+Once the learning period ends, two status fields are populated:
+
+**`status.suggestedNamespaces`** — A deduplicated list of namespaces inferred from observed `TrafficFlow` records (i.e., source or destination namespaces that aren't the generator's own namespace). These are candidates for `spec.policy.allowedNamespaces`.
+
+**`status.suggestedRules`** — A list of `SuggestedRule` objects, each with `port`, `protocol`, `direction`, and `count`. The `count` shows how many distinct traffic flows hit that port/protocol pair during the window. Higher counts indicate more frequently used paths.
+
+```yaml
+status:
+  phase: Enforcing           # automatically transitioned
+  lastAnalyzed: "2024-11-15T10:32:00Z"
+  suggestedNamespaces:
+    - monitoring
+    - ingress-nginx
+  suggestedRules:
+    - port: 8080
+      protocol: TCP
+      direction: ingress
+      count: 47
+    - port: 5432
+      protocol: TCP
+      direction: egress
+      count: 12
+```
+
+<Tip>
+  Review `status.suggestedRules` before the automatic transition to enforcing mode. If you see unexpected ports in the suggestions, investigate those workloads before the operator locks down traffic. You can delay the transition by increasing `spec.duration`.
+</Tip>
+
+### Automatic Transition to Enforcing
+
+After `spec.duration` elapses the operator writes both `status.phase: Enforcing` **and** `spec.mode: enforcing` to the CR. This triggers an immediate requeue into the enforcing handler, which generates and applies policies based on the current spec. The transition emits a `LearningCompleted` Kubernetes event:
+
+```text
+Normal  LearningCompleted  Learning period completed after 10m0s,
+                           switching to Enforcing mode
+                           (suggested 2 namespaces, 3 rules)
+```
+
+  </Tab>
+  <Tab title="Enforcing Mode">
+
+## Enforcing Mode
+
+Enforcing mode is where the operator takes action. On every reconcile pass it generates CNI-specific network policies from the CR spec and applies them to the cluster. You can enter enforcing mode directly — without going through learning — if you already know the traffic patterns you want to encode.
+
+### How It Works
+
+The enforcing handler follows this sequence on each reconcile:
+
+1. If `spec.templateName` is set, the named template's defaults are merged into the spec.
+2. `policy.NewPolicyEngine(spec.policyEngine)` selects the correct engine (`kubernetes` by default).
+3. `engine.GeneratePolicies(generator)` builds the policy objects in memory.
+4. Each generated policy is applied via a Create-or-Update against the API server.
+5. `status.policyDiff` is updated with the action taken (`Created` or `Updated`) for each policy.
+6. `status.appliedPoliciesCount` reflects the number of currently managed policies.
+7. The reconciler requeues after `5m` (the default requeue interval) to re-reconcile drift.
+
+### Required Fields
+
+| Field | Description |
+|-------|-------------|
+| `spec.mode` | Set to `"enforcing"` |
+| `spec.policy.type` | `"deny"` (allowlist) or `"allow"` (denylist) |
+| `spec.policy.allowedNamespaces` | Namespaces to allow when `type: deny` |
+| `spec.policy.deniedNamespaces` | Namespaces to deny when `type: allow` |
+
+### Example: Enforcing CR
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: test-policy-generator
+  namespace: production
+spec:
+  mode: "enforcing"
+
+  policy:
+    type: "deny"
+    allowedNamespaces:
+      - "test-ns1"
+      - "test-ns2"
+    deniedNamespaces:
+      - "test-ns3"
+      - "test-ns4"
+
+  globalRules:
+    - type: "allow"
+      port: 80
+      protocol: TCP
+      direction: "ingress"
+    - type: "allow"
+      port: 443
+      protocol: TCP
+      direction: "egress"
+```
+
+```bash
+kubectl apply -f enforcing.yaml
+
+# Monitor applied policy count and diff
+kubectl get networkpolicygenerator test-policy-generator \
+  -o jsonpath='{.status.policyDiff}' | jq .
+
+# Inspect the generated NetworkPolicy itself
+kubectl get networkpolicy test-policy-generator-generated -n production -o yaml
+```
+
+### Policy Diff Tracking
+
+Every reconcile records what changed in `status.policyDiff`:
+
+```yaml
+status:
+  phase: Enforcing
+  appliedPoliciesCount: 1
+  policyDiff:
+    - policyName: test-policy-generator-generated
+      namespace: production
+      action: Created
+      timestamp: "2024-11-15T10:45:00Z"
+```
+
+The `action` field is one of `Created`, `Updated`, or `Unchanged`. Use this as an audit trail to see when policies last changed and why.
+
+### Dry Run Mode
+
+Set `spec.dryRun: true` to generate policies without applying them. This is the safest way to preview what the operator will do before committing to enforcement.
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: dry-run-example
+  namespace: production
+spec:
+  mode: "enforcing"
+  dryRun: true
+
+  policy:
+    type: "deny"
+    allowedNamespaces:
+      - "monitoring"
+      - "logging"
+    podSelector:
+      app: "backend"
+
+  globalRules:
+    - type: "allow"
+      port: 8080
+      protocol: TCP
+      direction: "ingress"
+    - type: "allow"
+      namedPort: "https"
+      protocol: TCP
+      direction: "egress"
+
+  cidrRules:
+    - cidr: "10.0.0.0/8"
+      direction: "egress"
+```
+
+When `dryRun: true` is set:
+
+- Policies are serialized to JSON and stored in `status.generatedPolicies`.
+- `status.appliedPoliciesCount` is set to `0`.
+- `status.policyDiff` is cleared.
+- A `DryRun` event is emitted.
+
+```bash
+# Inspect the would-be policies
+kubectl get networkpolicygenerator dry-run-example \
+  -o jsonpath='{.status.generatedPolicies[0]}' | jq .
+```
+
+<Warning>
+  `spec.dryRun` only prevents the operator from applying policies. The CR itself is still written to the cluster. If you later set `dryRun: false`, the operator will immediately apply the policies on the next reconcile.
+</Warning>
+
+### Requeue Behavior
+
+The enforcing handler always requeues after `5m` (the `DefaultRequeueInterval` constant). This means the operator will re-reconcile every 5 minutes even if nothing changes, providing self-healing: if a generated policy is deleted manually, the operator will recreate it on the next pass.
+
+  </Tab>
+</Tabs>
+
+## Mode Comparison
+
+<CardGroup cols={2}>
+  <Card title="Learning" icon="graduation-cap">
+    **`spec.mode: learning`**
+
+    - Observes traffic for `spec.duration`
+    - Writes **no** network policies
+    - Populates `status.suggestedNamespaces` and `status.suggestedRules`
+    - Automatically transitions to enforcing when duration elapses
+  </Card>
+  <Card title="Enforcing" icon="shield-check">
+    **`spec.mode: enforcing`**
+
+    - Generates and applies policies immediately
+    - Tracks changes in `status.policyDiff`
+    - Supports `spec.dryRun: true` for safe preview
+    - Self-heals every 5 minutes via requeue
+  </Card>
+</CardGroup>
+
+## Switching Modes Manually
+
+You can switch between modes at any time by patching the CR:
+
+```bash
+# Switch from learning to enforcing early
+kubectl patch networkpolicygenerator my-app-learning \
+  --type=merge -p '{"spec":{"mode":"enforcing"}}'
+
+# Switch back to learning (e.g., after a deploy)
+kubectl patch networkpolicygenerator my-app-enforcing \
+  --type=merge -p '{"spec":{"mode":"learning","duration":"5m"}}'
+```
+
+<Note>
+  Switching back to learning mode does **not** delete existing policies immediately. Policies are only removed when the `NetworkPolicyGenerator` CR itself is deleted (triggering the finalizer cleanup) or when they are overwritten on the next enforcing reconcile.
+</Note>

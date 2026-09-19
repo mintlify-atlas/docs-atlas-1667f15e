@@ -1,0 +1,340 @@
+---
+title: "Built-in Policy Templates for Common Workload Types"
+sidebarTitle: "Templates"
+description: "Reference for the five built-in policy templates (zero-trust, web-app, backend-api, database, monitoring) with pre-configured rules and sample CRs."
+---
+
+Policy templates give you a pre-configured set of `globalRules` tuned for a specific workload archetype, so you can get a correct baseline policy in place quickly without manually enumerating every port and direction. You activate a template by setting `spec.templateName` on your `NetworkPolicyGenerator` resource. Templates are not mutually exclusive with custom rules — they form a baseline that your own `globalRules` override on a per-key basis.
+
+## How templates work
+
+When `spec.templateName` is set, the controller calls the template's `Apply` function during reconciliation. That function writes template-default rules into the spec, then merges them with any user-defined `globalRules` using the following priority model:
+
+<Steps>
+  <Step title="User rules are processed first">
+    Every rule in `spec.globalRules` is indexed by a deduplication key: `direction/protocol/port` (or `direction/protocol/namedPort` for named ports). These are inserted into the merged result at the highest priority.
+  </Step>
+  <Step title="Template rules fill gaps">
+    Template rules whose keys are **not already present** in the user list are appended. Rules whose keys collide with a user rule are silently dropped.
+  </Step>
+  <Step title="DNS egress is always appended">
+    After merging, the controller appends an egress rule for UDP/53 and TCP/53 toward `kube-system`. This happens independently of any template and cannot be disabled.
+  </Step>
+</Steps>
+
+This means you can override any single template rule (for example, changing the metrics port from 9090 to 9091) by defining that same `direction/protocol/port` key in your own `globalRules`, and the rest of the template remains intact.
+
+<Info>
+All five templates set `spec.policy.type: deny`. This means only namespaces listed in `allowedNamespaces` can communicate with the targeted pods. You must supply at least `kube-system` to keep DNS working, or rely on the automatic DNS egress rule.
+</Info>
+
+---
+
+## Template reference
+
+<Accordion title="zero-trust — high-security default-deny with DNS only">
+
+**Target workload:** Any namespace that requires maximum isolation — secrets management, compliance-sensitive services, internal certificate authorities.
+
+**What it pre-configures:**
+- Sets `policy.type: deny`
+- Does **not** add any port rules — all traffic is blocked by default
+- DNS egress (UDP/TCP 53) is still auto-appended by the controller
+
+**Effective posture after merging:** No ingress. No egress except DNS. Any traffic you need must be added as explicit `globalRules` or `cidrRules`.
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: vault-isolation
+  namespace: secrets
+spec:
+  mode: enforcing
+  templateName: zero-trust
+  policy:
+    type: deny
+    allowedNamespaces:
+      - kube-system
+```
+
+To open a specific port without leaving the zero-trust baseline, add a `globalRule`:
+
+```yaml
+spec:
+  templateName: zero-trust
+  policy:
+    type: deny
+    allowedNamespaces:
+      - kube-system
+      - audit-ns
+  globalRules:
+    - type: allow
+      port: 8200      # Vault API
+      protocol: TCP
+      direction: ingress
+```
+
+</Accordion>
+
+<Accordion title="web-app — HTTP/HTTPS ingress for frontend services">
+
+**Target workload:** Frontend web applications, ingress-facing services, static asset servers.
+
+**Pre-configured rules:**
+
+| Direction | Protocol | Port | Type |
+|---|---|---|---|
+| ingress | TCP | 80 | allow |
+| ingress | TCP | 443 | allow |
+| egress | TCP | 443 | allow |
+
+**What it pre-configures:**
+- `policy.type: deny`
+- Allows HTTP (80) and HTTPS (443) ingress from any IP
+- Allows HTTPS (443) egress for upstream API calls
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: template-web-app-example
+spec:
+  mode: enforcing
+  templateName: web-app
+  policy:
+    type: deny
+    allowedNamespaces:
+      - kube-system
+```
+
+**Customization example** — add a custom health-check port without touching the template's HTTP/HTTPS rules:
+
+```yaml
+spec:
+  templateName: web-app
+  policy:
+    type: deny
+    allowedNamespaces:
+      - kube-system
+  globalRules:
+    - type: allow
+      port: 8080      # custom health/metrics — takes precedence if same key
+      protocol: TCP
+      direction: ingress
+```
+
+</Accordion>
+
+<Accordion title="backend-api — API service with restricted egress">
+
+**Target workload:** Internal REST or gRPC API services, BFF (backend-for-frontend) layers, microservice backends.
+
+**Pre-configured rules:**
+
+| Direction | Protocol | Port | Type |
+|---|---|---|---|
+| ingress | TCP | 8080 | allow |
+| ingress | TCP | 8443 | allow |
+| ingress | TCP | 9090 | allow |
+| egress | TCP | 443 | allow |
+
+**What it pre-configures:**
+- `policy.type: deny`
+- Accepts ingress on common API ports (8080, 8443) and Prometheus metrics (9090)
+- Allows HTTPS egress for outbound service calls
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: template-backend-api-example
+spec:
+  mode: enforcing
+  templateName: backend-api
+  policy:
+    type: deny
+    allowedNamespaces:
+      - frontend-ns
+      - kube-system
+    podSelector:
+      app: api-server
+```
+
+**Customization example** — override the Prometheus port from 9090 to 9091:
+
+```yaml
+spec:
+  templateName: backend-api
+  policy:
+    type: deny
+    allowedNamespaces:
+      - kube-system
+  globalRules:
+    - type: allow
+      port: 9091      # key: ingress/TCP/9091 — template's 9090 rule is kept
+      protocol: TCP
+      direction: ingress
+```
+
+</Accordion>
+
+<Accordion title="database — strict ingress-only on database ports">
+
+**Target workload:** MySQL, PostgreSQL, Redis, MongoDB, and other stateful database pods.
+
+**Pre-configured rules:**
+
+| Direction | Protocol | Port | Type |
+|---|---|---|---|
+| ingress | TCP | 3306 | allow (MySQL) |
+| ingress | TCP | 5432 | allow (PostgreSQL) |
+| ingress | TCP | 6379 | allow (Redis) |
+| ingress | TCP | 27017 | allow (MongoDB) |
+
+**What it pre-configures:**
+- `policy.type: deny`
+- Accepts ingress on all four common database ports
+- **No egress** rules other than auto-appended DNS
+
+This posture means the database pod can only receive connections and resolve DNS — it cannot initiate outbound connections to the network.
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: template-database-example
+spec:
+  mode: enforcing
+  templateName: database
+  policy:
+    type: deny
+    allowedNamespaces:
+      - backend-ns
+    podSelector:
+      app: postgres
+```
+
+**Customization example** — add CockroachDB inter-node replication port:
+
+```yaml
+spec:
+  templateName: database
+  policy:
+    type: deny
+    allowedNamespaces:
+      - backend-ns
+  globalRules:
+    - type: allow
+      port: 26257     # CockroachDB SQL + raft
+      protocol: TCP
+      direction: ingress
+    - type: allow
+      port: 8080      # CockroachDB admin UI
+      protocol: TCP
+      direction: ingress
+```
+
+</Accordion>
+
+<Accordion title="monitoring — Prometheus scraping and observability stack">
+
+**Target workload:** Prometheus, Grafana, exporters, alertmanager, OpenTelemetry collectors.
+
+**Pre-configured rules:**
+
+| Direction | Protocol | Port | Type |
+|---|---|---|---|
+| ingress | TCP | 9090 | allow (Prometheus) |
+| ingress | TCP | 9100 | allow (node-exporter) |
+| egress | TCP | 9090 | allow (scrape targets) |
+| egress | TCP | 443 | allow (remote write / API) |
+
+**What it pre-configures:**
+- `policy.type: deny`
+- Accepts ingress on Prometheus (9090) and node-exporter (9100) ports
+- Allows egress to scrape remote targets (9090) and HTTPS for remote write
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: template-monitoring-example
+spec:
+  mode: enforcing
+  templateName: monitoring
+  policy:
+    type: deny
+    allowedNamespaces:
+      - kube-system
+    podSelector:
+      app: prometheus
+```
+
+**Customization example** — add Grafana (3000) and Alertmanager (9093):
+
+```yaml
+spec:
+  templateName: monitoring
+  policy:
+    type: deny
+    allowedNamespaces:
+      - kube-system
+      - ops-ns
+  globalRules:
+    - type: allow
+      port: 3000      # Grafana dashboard
+      protocol: TCP
+      direction: ingress
+    - type: allow
+      port: 9093      # Alertmanager
+      protocol: TCP
+      direction: ingress
+```
+
+</Accordion>
+
+---
+
+## Template quick-reference
+
+<CardGroup cols={2}>
+  <Card title="zero-trust" icon="shield-halved">
+    **Default-deny, no port rules.** Maximum isolation. All allowed traffic must be explicitly declared via `globalRules` or `cidrRules`.
+  </Card>
+  <Card title="web-app" icon="globe">
+    **HTTP (80) + HTTPS (443) ingress. HTTPS egress.** Ideal for internet-facing frontends and reverse proxies.
+  </Card>
+  <Card title="backend-api" icon="server">
+    **Ports 8080, 8443, 9090 ingress. HTTPS egress.** Covers most REST and gRPC microservice patterns with Prometheus metrics.
+  </Card>
+  <Card title="database" icon="database">
+    **MySQL, PostgreSQL, Redis, MongoDB ingress only.** Strict isolation for stateful workloads — no outbound except DNS.
+  </Card>
+  <Card title="monitoring" icon="chart-line">
+    **Prometheus (9090) + node-exporter (9100) ingress. Scrape + HTTPS egress.** Ready for Prometheus-based observability stacks.
+  </Card>
+</CardGroup>
+
+---
+
+## Selecting a template: decision guide
+
+```
+Is the workload internet-facing?
+  └── Yes → web-app
+  └── No
+      Is it a database or cache?
+        └── Yes → database
+        └── No
+            Is it an API service?
+              └── Yes → backend-api
+              └── No
+                  Is it an observability component?
+                    └── Yes → monitoring
+                    └── No (or maximum isolation needed) → zero-trust
+```
+
+<Tip>
+Start with the closest matching template and inspect `status.suggestedRules` after a learning run to identify any ports the template misses. Add those as `globalRules` overrides.
+</Tip>

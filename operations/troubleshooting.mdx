@@ -1,0 +1,316 @@
+---
+title: "Troubleshooting Guide for Network Policy Generator"
+sidebarTitle: "Troubleshooting"
+description: "Diagnose and resolve common problems with Helm installs, controller crashes, CRD lifecycle, stuck finalizers, webhook errors, and policy failures."
+---
+
+Most problems with Network Policy Generator fall into a small number of categories: Helm release lifecycle issues, controller startup failures, RBAC gaps, or CRD synchronization mismatches. The sections below provide exact commands to identify each root cause and the fastest path to resolution. Where a problem has more than one possible cause the most likely cause is listed first.
+
+---
+
+## Helm Issues
+
+<Accordion title="Helm install fails / stuck release (UPGRADE FAILED: has no deployed releases)">
+  A previous failed install or incomplete uninstall can leave a release in a non-deployable state. Helm refuses to upgrade a release that has no successfully deployed revision.
+
+  **Diagnose:**
+
+  ```bash
+  helm list -a --all-namespaces | grep network-policy-generator
+  ```
+
+  Look for releases with a status of `failed` or `pending-install`.
+
+  **Resolve:**
+
+  ```bash
+  # Force-remove the stuck release without running hooks
+  helm uninstall <release-name> --no-hooks
+
+  # Remove any leftover namespace resources
+  kubectl delete ns network-policy-generator-system --ignore-not-found
+  ```
+
+  Then re-run your install command.
+</Accordion>
+
+<Accordion title="CRD cleanup Job BackoffLimitExceeded (pre-delete hook failure)">
+  The pre-delete hook Job that removes `networkpolicygenerators.security.policy.io` CRD fails because its ServiceAccount does not have `apiextensions.k8s.io` delete permission, or the CRD is already gone.
+
+  **Diagnose:**
+
+  ```bash
+  kubectl get jobs -n network-policy-generator-system
+  kubectl describe job -n network-policy-generator-system \
+    -l app.kubernetes.io/name=network-policy-generator
+  ```
+
+  **Resolve:**
+
+  ```bash
+  # Uninstall without triggering the failing hook
+  helm uninstall <release-name> --no-hooks
+
+  # Manually remove the CRD if it still exists
+  kubectl delete crd networkpolicygenerators.security.policy.io --ignore-not-found
+
+  # Delete the stuck Job
+  kubectl delete job -n network-policy-generator-system \
+    -l app.kubernetes.io/name=network-policy-generator --ignore-not-found
+  ```
+</Accordion>
+
+<Accordion title="helm uninstall hangs indefinitely">
+  The pre-delete hook Job is retrying because the controller pod is down, leaving the Job unable to complete and Helm waiting for hook completion.
+
+  **Resolve:**
+
+  ```bash
+  # Bypass hooks entirely
+  helm uninstall <release-name> --no-hooks
+
+  # Clean up the namespace manually
+  kubectl delete ns network-policy-generator-system --ignore-not-found
+  ```
+
+  <Tip>
+    Always use `--no-hooks` on repeated uninstall attempts when the controller pod is not healthy.
+  </Tip>
+</Accordion>
+
+---
+
+## Controller Issues
+
+<Accordion title="Controller pod is CrashLoopBackOff">
+  The controller manager exits immediately after startup. This is almost always caused by a missing CRD, an RBAC permission denial, or a port conflict.
+
+  **Diagnose:**
+
+  ```bash
+  # Inspect the most recent crash log
+  kubectl logs -n network-policy-generator-system \
+    deployment/network-policy-generator-controller-manager --previous
+
+  # Check pod events for OOMKilled, port conflicts, or image pull errors
+  kubectl describe pod -n network-policy-generator-system \
+    -l control-plane=controller-manager
+  ```
+
+  **Common causes and fixes:**
+
+  | Cause | Fix |
+  |-------|-----|
+  | CRD not installed | `make install` or upgrade the Helm chart |
+  | RBAC permission denied | Verify `ClusterRole` and `ClusterRoleBinding` exist |
+  | Metrics port 8443 in use | Check for another process on that port |
+  | Health probe port 8081 in use | Check for another process on that port |
+
+  **Re-install CRDs if missing:**
+
+  ```bash
+  make install
+  # or via Helm
+  helm upgrade <release-name> ./helm/network-policy-generator
+  ```
+</Accordion>
+
+<Accordion title="CRD not found after install">
+  `kubectl get networkpolicygenerators` returns `error: the server doesn't have a resource type "networkpolicygenerators"`.
+
+  **Diagnose:**
+
+  ```bash
+  kubectl get crd networkpolicygenerators.security.policy.io
+  ```
+
+  **Resolve — via Make:**
+
+  ```bash
+  make install
+  ```
+
+  **Resolve — via Helm (CRDs are in `helm/network-policy-generator/crds/`):**
+
+  ```bash
+  helm upgrade <release-name> ./helm/network-policy-generator
+  ```
+
+  **Resolve — manual apply:**
+
+  ```bash
+  kubectl apply -f helm/network-policy-generator/crds/
+  ```
+</Accordion>
+
+<Accordion title="NetworkPolicy not generated after creating a CR">
+  You applied a `NetworkPolicyGenerator` resource but no `NetworkPolicy` (or `CiliumNetworkPolicy` / Calico `NetworkPolicy`) was created.
+
+  **Diagnose:**
+
+  ```bash
+  # 1. Check the status of the CR
+  kubectl get networkpolicygenerator <name> -n <namespace> -o yaml
+
+  # 2. Confirm the mode — policies are only generated in "enforcing" mode
+  kubectl get networkpolicygenerator <name> -n <namespace> \
+    -o jsonpath='{.spec.mode}'
+
+  # 3. Check phase — if "Learning", the duration may not have elapsed yet
+  kubectl get networkpolicygenerator <name> -n <namespace> \
+    -o jsonpath='{.status.phase}'
+
+  # 4. Look for reconciliation errors in controller logs
+  kubectl logs -n network-policy-generator-system \
+    deployment/network-policy-generator-controller-manager -f
+  ```
+
+  **Common causes:**
+
+  - `spec.mode` is `learning` and the `spec.duration` has not yet elapsed.
+  - A webhook rejection silently dropped the CR (check admission webhook logs).
+  - RBAC does not allow the controller to create `NetworkPolicy` objects in the target namespace.
+
+  **Verify RBAC:**
+
+  ```bash
+  kubectl auth can-i create networkpolicies \
+    --as=system:serviceaccount:network-policy-generator-system:network-policy-generator-controller-manager \
+    -n <target-namespace>
+  ```
+</Accordion>
+
+<Accordion title="Stuck finalizer — CR deletion hangs">
+  A `NetworkPolicyGenerator` you tried to delete is stuck in `Terminating` state because the controller is not running and cannot process the finalizer removal.
+
+  **Diagnose:**
+
+  ```bash
+  # Confirm the controller pod is absent or not ready
+  kubectl get pods -n network-policy-generator-system
+
+  # Confirm the finalizer is present
+  kubectl get networkpolicygenerator <name> -n <namespace> \
+    -o jsonpath='{.metadata.finalizers}'
+  ```
+
+  **Resolve — manually patch away the finalizer:**
+
+  ```bash
+  kubectl patch networkpolicygenerator <name> -n <namespace> \
+    -p '{"metadata":{"finalizers":null}}' --type=merge
+  ```
+
+  <Warning>
+    Removing the finalizer manually means the controller will not clean up generated `NetworkPolicy` objects. Delete them manually afterwards to avoid orphaned policies.
+  </Warning>
+</Accordion>
+
+---
+
+## Webhook Issues
+
+<Accordion title="Webhook errors — admission webhook unreachable or rejected">
+  The API server cannot reach the validation webhook, or the webhook rejects requests unexpectedly.
+
+  **Diagnose:**
+
+  ```bash
+  # Look for webhook-related errors
+  kubectl logs -n network-policy-generator-system \
+    deployment/network-policy-generator-controller-manager | grep -i webhook
+
+  # Check webhook configuration exists
+  kubectl get validatingwebhookconfigurations | grep network-policy-generator
+  kubectl get mutatingwebhookconfigurations | grep network-policy-generator
+  ```
+
+  **Common causes:**
+
+  1. **cert-manager not installed** — The webhook TLS certificates are provisioned by cert-manager. Install it before enabling webhooks:
+
+     ```bash
+     kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+     ```
+
+  2. **`--enable-webhooks` not set** — Webhooks are disabled by default. If the `ValidatingWebhookConfiguration` exists but the controller is not listening, either remove the webhook config or restart the controller with the flag enabled.
+
+  3. **Stale `caBundle`** — If you reinstalled cert-manager, the injected CA may be stale. Delete and recreate the webhook configurations, or trigger a cert-manager re-injection.
+</Accordion>
+
+---
+
+## Learning Mode Issues
+
+<Accordion title="Learning mode not transitioning to enforcing">
+  The `status.phase` stays `Learning` even after the expected duration has elapsed.
+
+  **Diagnose:**
+
+  ```bash
+  # Check the current phase and when the last reconcile ran
+  kubectl get networkpolicygenerator <name> -n <namespace> -o yaml
+
+  # Look for duration-parsing errors in controller logs
+  kubectl logs -n network-policy-generator-system \
+    deployment/network-policy-generator-controller-manager | grep -i duration
+  ```
+
+  **Common causes:**
+
+  - **Invalid duration format** — `spec.duration` must be a valid Go duration string (e.g. `30s`, `5m`, `1h`). An unparseable value prevents the timer from starting.
+  - **Controller pod restarted** — The in-memory timer is reset on restart. The learning window restarts from when the pod came back up.
+  - **Clock skew** — Large clock differences between nodes can cause the transition check to lag.
+
+  **Inspect phase and last transition time:**
+
+  ```bash
+  kubectl get networkpolicygenerator <name> -n <namespace> \
+    -o jsonpath='{.status.phase}'
+
+  kubectl get networkpolicygenerator <name> -n <namespace> \
+    -o jsonpath='{.status.lastTransitionTime}'
+  ```
+</Accordion>
+
+---
+
+## Build & CI Issues
+
+<Accordion title="make manifests generate shows a diff in CI">
+  The CI pipeline runs `make manifests generate` and finds uncommitted changes, causing the check to fail.
+
+  **Resolve:** Run the commands locally, commit the output, and push:
+
+  ```bash
+  make manifests generate
+  git add config/ api/
+  git commit -m "chore: update generated manifests"
+  git push
+  ```
+</Accordion>
+
+<Accordion title="Docker buildx fails — builder not found">
+  `make docker-buildx` fails with `error: no builder` or a similar message.
+
+  **Resolve:**
+
+  ```bash
+  # Create a dedicated BuildKit builder
+  docker buildx create --name network-policy-generator-builder --use
+
+  # Verify multi-platform support
+  docker buildx inspect --bootstrap
+  ```
+</Accordion>
+
+<Accordion title="git push rejected — remote is ahead of local">
+  Automated workflows (CHANGELOG.md, CONTRIBUTORS.md generation) pushed commits to `main` while you were working, leaving your branch behind.
+
+  **Resolve:**
+
+  ```bash
+  git pull --rebase origin main
+  git push origin main
+  ```
+</Accordion>

@@ -1,0 +1,333 @@
+---
+title: "Monitoring and Observability for Network Policy Generator"
+sidebarTitle: "Monitoring"
+description: "Prometheus metrics, ServiceMonitor setup, health probes, Kubernetes events, and status fields for observing Network Policy Generator in production."
+---
+
+Network Policy Generator exposes a rich observability surface spanning Prometheus metrics, health and readiness endpoints, Kubernetes Events, and structured status fields on the `NetworkPolicyGenerator` resource itself. This guide walks through every observable signal the operator produces so you can build dashboards, set up alerts, and diagnose issues without guesswork.
+
+---
+
+## Prometheus Metrics
+
+The operator registers seven custom metrics with the controller-runtime metrics registry at startup. All metric names are prefixed with `npg_` to avoid collisions with other Kubernetes operators.
+
+<CardGroup cols={2}>
+  <Card title="npg_reconcile_total" icon="arrow-rotate-right">
+    **Type:** Counter  
+    **Labels:** `result` (`success`, `error`)  
+    Total number of reconciliation attempts. Use this to understand overall reconcile throughput and error rates.
+  </Card>
+  <Card title="npg_policies_applied" icon="shield-check">
+    **Type:** Gauge  
+    **Labels:** `name`, `namespace`, `engine`  
+    Number of currently applied network policy objects per generator. Resets to `0` when dry-run is enabled.
+  </Card>
+  <Card title="npg_policy_operations_total" icon="list-check">
+    **Type:** Counter  
+    **Labels:** `action` (`Created`, `Updated`, `Deleted`)  
+    Running total of individual policy create/update/delete operations across all generators and engines.
+  </Card>
+  <Card title="npg_generators_active" icon="chart-bar">
+    **Type:** Gauge  
+    **Labels:** `phase` (`Learning`, `Enforcing`)  
+    Number of active `NetworkPolicyGenerator` resources currently in each phase. Useful for capacity planning.
+  </Card>
+  <Card title="npg_reconcile_duration_seconds" icon="clock">
+    **Type:** Histogram  
+    **Labels:** `mode`  
+    Duration of each reconciliation cycle in seconds, using the default Prometheus histogram buckets. Use this to track p99 reconcile latency.
+  </Card>
+  <Card title="npg_dry_run_total" icon="flask">
+    **Type:** Counter  
+    *(no labels)*  
+    Total number of dry-run reconciliations executed. Incremented every time a generator with `dryRun: true` is reconciled.
+  </Card>
+  <Card title="npg_validation_errors_total" icon="triangle-exclamation">
+    **Type:** Counter  
+    **Labels:** `type` (`webhook`, `reconcile`)  
+    Number of validation errors encountered. Alerts on this metric indicate misconfigured `NetworkPolicyGenerator` resources.
+  </Card>
+</CardGroup>
+
+---
+
+## Metrics Endpoint
+
+Metrics are served over **HTTPS on port `:8443`** by the controller-manager. The endpoint requires a valid bearer token from the in-cluster service account to authenticate (enforced via controller-runtime's `WithAuthenticationAndAuthorization` filter when `--metrics-secure=true`, which is the default).
+
+```bash
+# From inside the cluster — scrape metrics using the service account token
+TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+curl -sk -H "Authorization: Bearer ${TOKEN}" \
+  https://controller-manager-metrics-service.network-policy-generator-system.svc:8443/metrics \
+  | grep ^npg_
+```
+
+The metrics service is defined in the cluster as:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: network-policy-generator
+    app.kubernetes.io/managed-by: kustomize
+  name: controller-manager-metrics-service
+  namespace: network-policy-generator-system
+spec:
+  ports:
+    - name: https
+      port: 8443
+      protocol: TCP
+      targetPort: 8443
+  selector:
+    control-plane: controller-manager
+```
+
+---
+
+## ServiceMonitor for Prometheus Operator
+
+If you are running the [Prometheus Operator](https://github.com/prometheus-operator/prometheus-operator), deploy the bundled `ServiceMonitor` to have Prometheus discover and scrape the metrics endpoint automatically:
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/somaz94/network-policy-generator/main/config/prometheus/monitor.yaml
+```
+
+Or apply the manifest directly:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: network-policy-generator
+    app.kubernetes.io/managed-by: kustomize
+  name: controller-manager-metrics-monitor
+  namespace: network-policy-generator-system
+spec:
+  endpoints:
+    - path: /metrics
+      port: https
+      scheme: https
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        insecureSkipVerify: true   # replace with caFile/certFile/keyFile in production
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+```
+
+<Warning>
+  The bundled `ServiceMonitor` uses `insecureSkipVerify: true` for TLS verification. For production deployments, replace this with proper certificate configuration using `caFile`, `certFile`, and `keyFile` pointing to your TLS assets, or configure cert-manager to issue a certificate for the metrics service.
+</Warning>
+
+---
+
+## Standalone Prometheus Scrape Config
+
+If you are running Prometheus without the Prometheus Operator, add a scrape job to your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: network-policy-generator
+    scheme: https
+    tls_config:
+      insecure_skip_verify: true   # use ca_file in production
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    static_configs:
+      - targets:
+          - controller-manager-metrics-service.network-policy-generator-system.svc:8443
+    metrics_path: /metrics
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+```
+
+---
+
+## Sample PromQL Queries
+
+Use these queries in Grafana or the Prometheus expression browser to build dashboards and alerts:
+
+```promql
+# Reconcile error rate over the last 5 minutes
+rate(npg_reconcile_total{result="error"}[5m])
+
+# Ratio of error reconciles to total reconciles
+rate(npg_reconcile_total{result="error"}[5m])
+  / rate(npg_reconcile_total[5m])
+
+# Total policies currently applied across all generators and engines
+sum(npg_policies_applied)
+
+# Policies applied broken down by engine
+sum by (engine) (npg_policies_applied)
+
+# 99th percentile reconcile duration in enforcing mode
+histogram_quantile(0.99,
+  rate(npg_reconcile_duration_seconds_bucket{mode="enforcing"}[10m])
+)
+
+# Rate of policy create operations (new policies being generated)
+rate(npg_policy_operations_total{action="Created"}[5m])
+
+# Validation error rate — alert if this is > 0
+rate(npg_validation_errors_total[5m])
+
+# Number of generators currently in learning phase
+npg_generators_active{phase="Learning"}
+```
+
+---
+
+## Health Probes
+
+The operator exposes standard controller-runtime health and readiness endpoints on **port `:8081`**:
+
+| Path | Type | Description |
+|---|---|---|
+| `GET /healthz` | Liveness | Returns `200 OK` when the manager's internal health check (`healthz.Ping`) passes. Used by Kubernetes to decide whether to restart the pod. |
+| `GET /readyz` | Readiness | Returns `200 OK` when the manager is ready to serve traffic. Used by Kubernetes to decide whether to route requests to the pod. |
+
+```bash
+# Check liveness from inside the cluster or a debug pod
+kubectl exec -n network-policy-generator-system \
+  deployment/network-policy-generator-controller-manager -- \
+  wget -qO- http://localhost:8081/healthz
+
+# Check readiness
+kubectl exec -n network-policy-generator-system \
+  deployment/network-policy-generator-controller-manager -- \
+  wget -qO- http://localhost:8081/readyz
+```
+
+Both endpoints are registered using `healthz.Ping` from controller-runtime and do not require authentication. They are configured via the `--health-probe-bind-address` flag (default: `:8081`).
+
+---
+
+## Kubernetes Events
+
+The operator records Kubernetes Events on each `NetworkPolicyGenerator` resource throughout its lifecycle. Events are the fastest way to understand what the operator has done during a specific reconcile cycle.
+
+View events for a generator:
+
+```bash
+kubectl describe networkpolicygenerator <name>
+# Scroll to the "Events" section at the bottom
+
+# Or stream events in real time
+kubectl get events \
+  --field-selector involvedObject.name=<name> \
+  --watch
+```
+
+### Event Reference
+
+| Reason | Type | Trigger |
+|---|---|---|
+| `PolicyCreated` | Normal | A new network policy object was created successfully |
+| `PolicyUpdated` | Normal | An existing policy was updated to reflect a spec change |
+| `DryRun` | Normal | Dry-run reconcile completed; N policies generated but not applied |
+| `GenerationFailed` | Warning | The policy engine failed to generate policy objects |
+| `ApplyFailed` | Warning | A generated policy could not be written to the API server |
+
+Each event message includes the engine name (`kubernetes`, `cilium`, or `calico`), the policy namespace, and the policy name to make correlation straightforward.
+
+---
+
+## Status Fields for Observability
+
+The `NetworkPolicyGeneratorStatus` subresource exposes several fields that provide a real-time view into the operator's state:
+
+<Tabs>
+  <Tab title="Phase and timing">
+    ```bash
+    # Current phase (Learning, Enforcing)
+    kubectl get networkpolicygenerator <name> \
+      -o jsonpath='{.status.phase}'
+
+    # When traffic was last analyzed in learning mode
+    kubectl get networkpolicygenerator <name> \
+      -o jsonpath='{.status.lastAnalyzed}'
+    ```
+
+    | Field | Type | Description |
+    |---|---|---|
+    | `status.phase` | string | Current phase: `Learning` or `Enforcing` |
+    | `status.lastAnalyzed` | timestamp | Last time traffic analysis ran in learning mode |
+  </Tab>
+
+  <Tab title="Policy counts and diff">
+    ```bash
+    # Number of policy objects currently managed
+    kubectl get networkpolicygenerator <name> \
+      -o jsonpath='{.status.appliedPoliciesCount}'
+
+    # Most recent policy diff (Created/Updated entries)
+    kubectl get networkpolicygenerator <name> \
+      -o jsonpath='{.status.policyDiff}' | jq .
+    ```
+
+    | Field | Type | Description |
+    |---|---|---|
+    | `status.appliedPoliciesCount` | int | Number of policy objects currently applied (`0` in dry-run) |
+    | `status.policyDiff` | array | Per-policy diff from the last reconcile (`Created` or `Updated`) |
+  </Tab>
+
+  <Tab title="Dry-run output">
+    ```bash
+    # JSON array of generated policy objects (dry-run only)
+    kubectl get networkpolicygenerator <name> \
+      -o jsonpath='{.status.generatedPolicies}' | jq .
+
+    # Pretty-print the first generated policy
+    kubectl get networkpolicygenerator <name> \
+      -o jsonpath='{.status.generatedPolicies[0]}' | jq .
+    ```
+
+    | Field | Type | Description |
+    |---|---|---|
+    | `status.generatedPolicies` | string array | JSON-serialised policy objects; populated only when `spec.dryRun: true` |
+  </Tab>
+
+  <Tab title="Learning mode suggestions">
+    ```bash
+    # Namespace names observed during learning (use as allowedNamespaces)
+    kubectl get networkpolicygenerator <name> \
+      -o jsonpath='{.status.suggestedNamespaces}' | jq .
+
+    # Port/protocol rules observed during learning
+    kubectl get networkpolicygenerator <name> \
+      -o jsonpath='{.status.suggestedRules}' | jq .
+    ```
+
+    | Field | Type | Description |
+    |---|---|---|
+    | `status.suggestedNamespaces` | string array | Namespace names observed communicating with target pods |
+    | `status.suggestedRules` | array | Port/protocol rules seen during learning with observation counts |
+  </Tab>
+</Tabs>
+
+---
+
+## All-in-One Status Snapshot
+
+To get a complete observability snapshot for a generator in one command:
+
+```bash
+kubectl get networkpolicygenerator <name> -o json | jq '{
+  name: .metadata.name,
+  namespace: .metadata.namespace,
+  phase: .status.phase,
+  lastAnalyzed: .status.lastAnalyzed,
+  appliedPoliciesCount: .status.appliedPoliciesCount,
+  policyDiff: .status.policyDiff,
+  generatedPolicies: (.status.generatedPolicies // []) | length,
+  suggestedNamespaces: .status.suggestedNamespaces,
+  suggestedRulesCount: (.status.suggestedRules // []) | length
+}'
+```

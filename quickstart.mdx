@@ -1,47 +1,352 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Quick Start: Your First NetworkPolicyGenerator in 10 Minutes"
+sidebarTitle: "Quick Start"
+description: "Create a NetworkPolicyGenerator in enforcing and learning modes, inspect generated NetworkPolicies, and preview changes with dry-run — all in under 10 minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This guide walks you from a freshly installed operator to a working `NetworkPolicyGenerator` resource that generates real Kubernetes NetworkPolicies. You will deploy a deny-based policy in enforcing mode, inspect the results, then switch to learning mode to observe how the operator surfaces data-driven suggestions from live traffic. Finally you will use dry-run mode to preview a more complex policy before it touches your cluster.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+<Note>
+  Complete the [installation guide](/installation) before following these steps. The commands below assume the operator is running and the `NetworkPolicyGenerator` CRD is registered.
+</Note>
 
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+## Step-by-Step Walkthrough
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Verify the operator is ready">
+    Before creating any resources, confirm the controller pod is healthy:
 
     ```bash
-    npm install your-package
+    kubectl get pods -n network-policy-generator-system
+    ```
+
+    You should see the controller in `Running` state:
+
+    ```bash
+    NAME                                                         READY   STATUS    RESTARTS   AGE
+    network-policy-generator-controller-manager-<hash>          1/1     Running   0          2m
+    ```
+
+    Also confirm the CRD is available:
+
+    ```bash
+    kubectl api-resources --api-group=security.policy.io
+    ```
+
+    ```bash
+    NAME                       SHORTNAMES   APIVERSION              NAMESPACED   KIND
+    networkpolicygenerators                 security.policy.io/v1   true         NetworkPolicyGenerator
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Create a deny-based policy in enforcing mode">
+    The simplest enforcing-mode resource uses `policy.type: deny` — this means all namespaces are blocked by default and only the namespaces listed under `allowedNamespaces` may communicate with pods in this namespace.
+
+    Save the following as `deny-policy.yaml`:
+
+    ```yaml
+    apiVersion: security.policy.io/v1
+    kind: NetworkPolicyGenerator
+    metadata:
+      name: test-policy-generator-deny
+      labels:
+        app.kubernetes.io/name: network-policy-generator
+        app.kubernetes.io/managed-by: kustomize
+    spec:
+      mode: "enforcing"  # learning or enforcing
+      # duration: "1m"   # required when mode is learning
+
+      policy:
+        type: "deny"          # allow or deny
+        allowedNamespaces:    # used when type is deny
+          - "test-ns1"
+          - "test-ns2"
+
+      globalRules:            # consolidated global rules
+        - type: "allow"       # allow or deny
+          port: 80
+          protocol: TCP
+          direction: "ingress"  # ingress or egress
+        - type: "allow"
+          port: 443
+          protocol: TCP
+          direction: "egress"
+    ```
+
+    Apply it to the cluster:
 
     ```bash
-    your-cli init
+    kubectl apply -f deny-policy.yaml
+    ```
+
+    <Tip>
+      The resource is namespace-scoped. If you omit `metadata.namespace` it is created in your current namespace context. The operator generates NetworkPolicy objects in the same namespace as the `NetworkPolicyGenerator`.
+    </Tip>
+  </Step>
+
+  <Step title="Check the resource status">
+    The reconciler processes the resource immediately. Check the current phase:
+
+    ```bash
+    kubectl get networkpolicygenerator
+    ```
+
+    ```bash
+    NAME                         PHASE       LASTANALYZED   AGE
+    test-policy-generator-deny   Enforcing                  15s
+    ```
+
+    For a full status dump including the policy diff and applied policy count:
+
+    ```bash
+    kubectl describe networkpolicygenerator test-policy-generator-deny
+    ```
+
+    Look for the `Status` section in the output:
+
+    ```bash
+    Status:
+      Applied Policies Count:  1
+      Phase:                   Enforcing
+      Policy Diff:
+        Action:      Created
+        Namespace:   default
+        Policy Name: test-policy-generator-deny
+        Timestamp:   2024-01-01T00:00:15Z
+    ```
+
+    To retrieve the status as raw YAML for scripting or inspection:
+
+    ```bash
+    kubectl get networkpolicygenerator test-policy-generator-deny -o yaml
     ```
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Verify the NetworkPolicy was created">
+    The operator creates Kubernetes `NetworkPolicy` objects in the same namespace as the generator. List all NetworkPolicies to confirm:
 
     ```bash
-    your-cli start
+    kubectl get networkpolicy
     ```
+
+    ```bash
+    NAME                         POD-SELECTOR   AGE
+    test-policy-generator-deny   <none>         30s
+    ```
+
+    Inspect the generated policy to see the exact rules the operator wrote:
+
+    ```bash
+    kubectl describe networkpolicy test-policy-generator-deny
+    ```
+
+    To view policies across all namespaces (useful when multiple generators are running):
+
+    ```bash
+    kubectl get networkpolicy -A
+    ```
+  </Step>
+
+  <Step title="Observe traffic suggestions in learning mode">
+    Learning mode lets the operator watch actual pod-to-pod traffic for a configurable duration and surface namespace and rule suggestions. This is the recommended first step when you are unsure which rules to write.
+
+    Save the following as `learning-policy.yaml`:
+
+    ```yaml
+    apiVersion: security.policy.io/v1
+    kind: NetworkPolicyGenerator
+    metadata:
+      name: traffic-learner
+    spec:
+      mode: "learning"
+      duration: "5m"    # Observe traffic for 5 minutes
+      policy:
+        type: "deny"
+    ```
+
+    Apply it:
+
+    ```bash
+    kubectl apply -f learning-policy.yaml
+    ```
+
+    The resource enters the `Learning` phase immediately:
+
+    ```bash
+    kubectl get networkpolicygenerator traffic-learner
+    ```
+
+    ```bash
+    NAME              PHASE      LASTANALYZED   AGE
+    traffic-learner   Learning                  10s
+    ```
+
+    After the 5-minute observation window, the operator transitions the resource to `Analyzing` and then populates the suggestions. Query them with `jsonpath`:
+
+    ```bash
+    # Namespaces observed communicating with pods in this namespace
+    kubectl get networkpolicygenerator traffic-learner \
+      -o jsonpath='{.status.suggestedNamespaces}'
+
+    # Port/protocol rules observed during the learning window
+    kubectl get networkpolicygenerator traffic-learner \
+      -o jsonpath='{.status.suggestedRules}'
+    ```
+
+    Example output for `suggestedRules`:
+
+    ```json
+    [
+      {"port": 80,  "protocol": "TCP", "direction": "ingress", "count": 142},
+      {"port": 443, "protocol": "TCP", "direction": "egress",  "count": 89},
+      {"port": 53,  "protocol": "UDP", "direction": "egress",  "count": 203}
+    ]
+    ```
+
+    <Info>
+      The `count` field shows how many times each port/protocol combination was observed during the learning window. Use higher-count entries as the basis for your `globalRules` when transitioning to enforcing mode. A zero `duration` is rejected by the CRD's CEL validation rules — always supply a positive duration for `learning` mode.
+    </Info>
+
+    To view the full observed traffic flows:
+
+    ```bash
+    kubectl get networkpolicygenerator traffic-learner \
+      -o jsonpath='{.status.observedTraffic}' | python3 -m json.tool
+    ```
+  </Step>
+
+  <Step title="Preview policies with dry-run mode">
+    Before applying a more complex policy to a production namespace, use `dryRun: true` to generate the NetworkPolicy YAML and store it in `.status.generatedPolicies` without creating any live objects.
+
+    Save the following as `dry-run-policy.yaml`:
+
+    ```yaml
+    apiVersion: security.policy.io/v1
+    kind: NetworkPolicyGenerator
+    metadata:
+      name: dry-run-example
+      labels:
+        app.kubernetes.io/name: network-policy-generator
+        app.kubernetes.io/managed-by: kustomize
+    spec:
+      mode: "enforcing"
+      dryRun: true              # Generate policies without applying
+
+      policy:
+        type: "deny"
+        allowedNamespaces:
+          - "monitoring"
+          - "logging"
+        podSelector:
+          app: "backend"
+
+      globalRules:
+        - type: "allow"
+          port: 8080
+          protocol: TCP
+          direction: "ingress"
+        - type: "allow"
+          namedPort: "https"
+          protocol: TCP
+          direction: "egress"
+
+      cidrRules:
+        - cidr: "10.0.0.0/8"
+          direction: "egress"
+    ```
+
+    Apply it:
+
+    ```bash
+    kubectl apply -f dry-run-policy.yaml
+    ```
+
+    Confirm no live NetworkPolicy objects were created:
+
+    ```bash
+    kubectl get networkpolicy
+    # dry-run-example should NOT appear here
+    ```
+
+    Retrieve the generated policy JSON from the resource status:
+
+    ```bash
+    kubectl get networkpolicygenerator dry-run-example \
+      -o jsonpath='{.status.generatedPolicies[0]}' | python3 -m json.tool
+    ```
+
+    The output is the complete NetworkPolicy object that would be applied if `dryRun` were `false`. Review it, then update your spec if needed and remove `dryRun: true` to enforce the policy for real:
+
+    ```bash
+    kubectl patch networkpolicygenerator dry-run-example \
+      --type='merge' -p '{"spec":{"dryRun":false}}'
+    ```
+
+    <Tip>
+      Check `.status.policyDiff` after switching from dry-run to live enforcement to see the `Created` audit entry with a timestamp:
+
+      ```bash
+      kubectl get networkpolicygenerator dry-run-example \
+        -o jsonpath='{.status.policyDiff}' | python3 -m json.tool
+      ```
+    </Tip>
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## What You Built
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+By completing this guide you have:
+
+- Deployed a deny-based `NetworkPolicyGenerator` in `enforcing` mode that restricts namespace communication to an explicit allowlist
+- Confirmed the operator generated and applied a Kubernetes `NetworkPolicy` object
+- Run the operator in `learning` mode and queried the namespace and rule suggestions it surfaces from observed traffic
+- Used `dryRun: true` to preview a complex policy (pod selector, named ports, CIDR rules) before it touched the live cluster
+
+## Common kubectl Reference
+
+```bash
+# List all generators and their phases
+kubectl get networkpolicygenerator
+
+# Describe a generator (status, events, conditions)
+kubectl describe networkpolicygenerator <name>
+
+# Full YAML dump including status
+kubectl get networkpolicygenerator <name> -o yaml
+
+# View generated policies in dry-run mode
+kubectl get networkpolicygenerator <name> \
+  -o jsonpath='{.status.generatedPolicies}'
+
+# View suggested namespaces from learning mode
+kubectl get networkpolicygenerator <name> \
+  -o jsonpath='{.status.suggestedNamespaces}'
+
+# View suggested rules from learning mode
+kubectl get networkpolicygenerator <name> \
+  -o jsonpath='{.status.suggestedRules}'
+
+# View policy diff / audit trail
+kubectl get networkpolicygenerator <name> \
+  -o jsonpath='{.status.policyDiff}'
+
+# List all generated NetworkPolicies across all namespaces
+kubectl get networkpolicy -A
+
+# Delete a generator (also removes its generated NetworkPolicy objects)
+kubectl delete networkpolicygenerator <name>
+```
+
+## Explore Further
+
+<CardGroup cols={3}>
+  <Card title="Policy Engines" icon="gear" href="/introduction#policy-engines-at-a-glance">
+    Switch to Cilium or Calico with a single `policyEngine` field.
+  </Card>
+  <Card title="Built-in Templates" icon="layer-group" href="/introduction#built-in-policy-templates">
+    Use `zero-trust`, `web-app`, `database`, and other templates as a hardened starting point.
+  </Card>
+  <Card title="Helm Configuration" icon="sliders" href="/installation#helm-values-reference">
+    Tune resource limits, leader election, and metrics via Helm values.
+  </Card>
+</CardGroup>

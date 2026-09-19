@@ -1,0 +1,300 @@
+---
+title: "Network Policy Generator Operator Flags"
+sidebarTitle: "Operator Flags"
+description: "All command-line flags accepted by the network-policy-generator operator binary, with defaults, Helm value mappings, and security guidance for each flag."
+---
+
+The `network-policy-generator` operator binary (`/manager`) is a standard controller-runtime manager process. Its runtime behaviour is tuned entirely through command-line flags — there is no separate configuration file. When deployed via the Helm chart, most flags are injected into the Deployment `args` array from values in `values.yaml`. This page documents every supported flag, its default, and the circumstances under which you should override it.
+
+<Note>
+  The Helm chart default for `controller.leaderElect` is `true`. The operator binary
+  itself defaults `--leader-elect` to `false`. Always verify your deployment manifest
+  or Helm values to know the active setting.
+</Note>
+
+---
+
+## Flag Reference
+
+### `--metrics-bind-address`
+
+<ParamField path="--metrics-bind-address" type="string" default="0">
+  Network address the Prometheus metrics HTTP/HTTPS server binds to.
+
+  | Value | Effect |
+  |-------|--------|
+  | `0` | Metrics endpoint **disabled** (binary default) |
+  | `:8443` | HTTPS metrics on port 8443 (Helm chart default) |
+  | `:8080` | HTTP metrics on port 8080 (requires `--metrics-secure=false`) |
+
+  **When to change:**  
+  Leave as `:8443` in production. Use `0` only in minimal test environments where
+  you have no Prometheus scraper. Switch to `:8080` combined with `--metrics-secure=false`
+  only in air-gapped or development clusters where you cannot provision TLS certificates.
+
+  **Helm value:** `controller.metricsBindAddress`
+
+  ```yaml
+  # values.yaml
+  controller:
+    metricsBindAddress: ":8443"
+  ```
+
+  **Security implications:**  
+  When `--metrics-secure=true` (the default), the metrics endpoint is protected by
+  Kubernetes token authentication and authorization via the controller-runtime
+  `WithAuthenticationAndAuthorization` filter. Disabling HTTPS or binding to `0.0.0.0`
+  without authentication exposes internal reconcile metrics to any network-reachable client.
+</ParamField>
+
+---
+
+### `--health-probe-bind-address`
+
+<ParamField path="--health-probe-bind-address" type="string" default=":8081">
+  Network address for liveness (`/healthz`) and readiness (`/readyz`) HTTP probe
+  endpoints.
+
+  The Kubernetes kubelet accesses this port directly from the node; it does not go
+  through the Service mesh or NetworkPolicy (unless a `hostNetwork: true` pod
+  NetworkPolicy restricts it).
+
+  **When to change:**  
+  Only change this if port `8081` conflicts with another process on the same node.
+  The value must match `probes.liveness.port` and `probes.readiness.port` in the
+  Helm values.
+
+  **Helm value:** `controller.healthProbeBindAddress`
+
+  ```yaml
+  # values.yaml
+  controller:
+    healthProbeBindAddress: ":8081"
+
+  probes:
+    liveness:
+      port: 8081
+    readiness:
+      port: 8081
+  ```
+
+  **Corresponding manager.yaml args:**
+  ```yaml
+  args:
+    - --health-probe-bind-address=:8081
+  ```
+</ParamField>
+
+---
+
+### `--leader-elect`
+
+<ParamField path="--leader-elect" type="boolean" default="false (binary); true (Helm chart)">
+  Enables leader election via a Kubernetes Lease object, ensuring that only one
+  replica of the operator is actively reconciling at any time. The leader election
+  ID is `1a46b0b9.policy.io`.
+
+  | Setting | Use case |
+  |---------|----------|
+  | `false` | Single-replica deployments, local development |
+  | `true` | HA deployments (`replicas: 2+`), production |
+
+  **When to enable:**  
+  Enable whenever you run more than one replica. Without leader election, multiple
+  replicas will race to reconcile the same generators simultaneously, potentially
+  creating duplicate policies or causing conflicting updates.
+
+  **When to disable:**  
+  During local development with `kind` or `minikube` where you run a single replica
+  and want to avoid the Lease TTL delay on startup.
+
+  **Helm value:** `controller.leaderElect`
+
+  ```yaml
+  # values.yaml
+  controller:
+    leaderElect: true
+  ```
+
+  <Warning>
+    If you scale the Deployment to more than one replica without enabling leader
+    election, you will see duplicate policy creation events in `status.policyDiff`
+    and inflated `npg_policy_operations_total` counter values.
+  </Warning>
+</ParamField>
+
+---
+
+### `--metrics-secure`
+
+<ParamField path="--metrics-secure" type="boolean" default="true">
+  When `true`, the metrics server uses HTTPS with TLS certificates and enforces
+  Kubernetes bearer-token authentication and RBAC authorization via the
+  controller-runtime `WithAuthenticationAndAuthorization` filter.
+
+  When `false`, metrics are served over plain HTTP with no authentication.
+
+  **When to change:**  
+  Leave as `true` in all production and staging environments. Set to `false` only
+  in local development or when debugging metrics without access to a Prometheus
+  instance that can present a service account token.
+
+  **Interaction with `--metrics-bind-address`:**
+  - `--metrics-bind-address=:8443 --metrics-secure=true` → HTTPS + authn/authz ✅
+  - `--metrics-bind-address=:8080 --metrics-secure=false` → HTTP, no auth ⚠️
+  - `--metrics-bind-address=:8443 --metrics-secure=false` → HTTPS without auth (not recommended)
+
+  **Security implications:**  
+  Disabling secure metrics exposes reconcile counters, active generator counts,
+  and policy operation rates without any access control. In a multi-tenant cluster
+  this can leak information about workload topology and policy enforcement cadence.
+
+  ```bash
+  # Override via Helm
+  helm upgrade network-policy-generator oci://ghcr.io/somaz94/charts/network-policy-generator \
+    --set controller.metricsBindAddress=":8080" \
+    --set-string 'manager.args[0]=--metrics-secure=false'
+  ```
+</ParamField>
+
+---
+
+### `--enable-http2`
+
+<ParamField path="--enable-http2" type="boolean" default="false">
+  Enables HTTP/2 for the metrics and webhook servers. Disabled by default to
+  mitigate known HTTP/2 CVEs.
+
+  **CVEs mitigated by the default `false`:**
+  - [GHSA-qppj-fm5r-hxr3](https://github.com/advisories/GHSA-qppj-fm5r-hxr3) — HTTP/2 Stream Cancellation
+  - [GHSA-4374-p667-p6c8](https://github.com/advisories/GHSA-4374-p667-p6c8) — HTTP/2 Rapid Reset
+
+  When `false`, the TLS configuration is patched at startup to force `http/1.1`
+  as the only accepted next-protocol:
+
+  ```go
+  // From cmd/main.go
+  disableHTTP2 := func(c *tls.Config) {
+      setupLog.Info("disabling http/2")
+      c.NextProtos = []string{"http/1.1"}
+  }
+  ```
+
+  **When to enable:**  
+  Only enable HTTP/2 if you have verified that your infrastructure is patched against
+  the above CVEs AND you require HTTP/2-specific features (multiplexing, server push)
+  on the metrics or webhook endpoint. In practice, standard Prometheus scraping works
+  correctly over HTTP/1.1.
+
+  <Warning>
+    Enabling `--enable-http2` without verifying your Go runtime and infrastructure
+    patches exposes the operator to denial-of-service attacks via HTTP/2 stream
+    exhaustion. The default `false` is the safe choice for all production deployments.
+  </Warning>
+</ParamField>
+
+---
+
+### `--enable-webhooks`
+
+<ParamField path="--enable-webhooks" type="boolean" default="false">
+  Enables the validating admission webhook at path
+  `/validate-security-policy-io-v1-networkpolicygenerator`. The webhook fires on
+  `CREATE` and `UPDATE` operations for `NetworkPolicyGenerator` resources, performing
+  CIDR validation and richer cross-field checks that are not feasible within the
+  CEL cost budget.
+
+  When `false` (the default), only the CEL rules embedded in the CRD schema are
+  enforced. CEL covers the most critical invariants (duration requirement, port XOR
+  namedPort, namespace overlap), so most deployments do not need the webhook.
+
+  **Prerequisites before enabling:**
+  1. A TLS certificate must be available at the standard controller-runtime webhook
+     server path, or cert-manager must be installed and configured to provision one.
+  2. The `MutatingWebhookConfiguration` / `ValidatingWebhookConfiguration` objects
+     must exist in the cluster (generated by `config/default/kustomization.yaml`
+     or the Helm chart's webhook sub-chart).
+  3. The operator pod must be reachable from the API server on the webhook port.
+
+  **When to enable:**  
+  Enable in production environments where you want full CIDR-format validation and
+  the richer webhook diagnostics described in the [CRD Validation](/reference/crd-validation)
+  reference. Particularly valuable when multiple teams submit `NetworkPolicyGenerator`
+  manifests via CI/CD pipelines.
+
+  ```bash
+  # Enable via operator args
+  args:
+    - --enable-webhooks=true
+  ```
+
+  ```bash
+  # Verify the webhook is registered
+  kubectl get validatingwebhookconfigurations | grep network-policy-generator
+  ```
+
+  <Note>
+    The webhook uses `failurePolicy: Fail` — if the webhook pod is unavailable,
+    ALL creates and updates to `NetworkPolicyGenerator` will be rejected by the
+    API server. Ensure your operator Deployment has sufficient replicas and appropriate
+    PodDisruptionBudget settings before enabling in production.
+  </Note>
+</ParamField>
+
+---
+
+## Helm Values Quick Reference
+
+The following `values.yaml` keys map to operator flags. All values below reflect the Helm chart defaults from `helm/network-policy-generator/values.yaml`.
+
+```yaml
+controller:
+  metricsBindAddress: ":8443"       # --metrics-bind-address
+  healthProbeBindAddress: ":8081"   # --health-probe-bind-address
+  leaderElect: true                 # --leader-elect
+
+metrics:
+  enabled: true
+  port: 8443
+
+service:
+  type: ClusterIP
+  port: 8443
+
+probes:
+  liveness:
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    port: 8081
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    port: 8081
+```
+
+<Note>
+  The `--metrics-secure` and `--enable-http2` flags do not have dedicated Helm
+  value keys in the current chart. Override them by appending extra args to the
+  manager container in a custom values file or via `--set`.
+</Note>
+
+---
+
+## Full Production-Ready Args Example
+
+The following Deployment args snippet reflects a recommended production configuration with leader election, secure metrics, and webhooks enabled:
+
+```yaml
+containers:
+  - name: manager
+    command:
+      - /manager
+    args:
+      - --metrics-bind-address=:8443
+      - --health-probe-bind-address=:8081
+      - --leader-elect=true
+      - --metrics-secure=true
+      - --enable-http2=false
+      - --enable-webhooks=true
+    image: somaz940/network-policy-generator:v0.4.0
+```

@@ -1,0 +1,318 @@
+---
+title: "Policy Rules Deep Dive: Types, CIDRs & Named Ports"
+sidebarTitle: "Policy Rules"
+description: "In-depth guide to allow/deny policy types, global port rules, CIDR-based external access rules, named ports, and automatic DNS egress behavior."
+---
+
+Every `NetworkPolicyGenerator` resource expresses its intent through three complementary rule layers: a top-level **policy type** that sets the default posture (allow-all or deny-all at the namespace level), **global rules** that punch precise port-level holes through that posture, and **CIDR rules** that govern traffic to and from external IP ranges. Understanding how these layers interact is the key to writing concise, correct network policies.
+
+---
+
+## Policy type: allow vs deny
+
+The `spec.policy.type` field chooses between two opposite default postures. Every namespace access decision flows from this single field before any other rules are evaluated.
+
+<Tabs>
+  <Tab title="deny + allowedNamespaces (recommended)">
+    The `deny` type implements a **default-deny / allow-list** model. All namespace-to-namespace traffic is blocked by default; only namespaces listed in `allowedNamespaces` are permitted.
+
+    This is the recommended posture for production workloads because it follows the principle of least privilege — new namespaces are automatically isolated unless explicitly added to the list.
+
+    ```yaml
+    apiVersion: security.policy.io/v1
+    kind: NetworkPolicyGenerator
+    metadata:
+      name: backend-allowlist
+      namespace: production
+    spec:
+      mode: enforcing
+      policy:
+        type: deny
+        allowedNamespaces:
+          - kube-system
+          - monitoring
+          - frontend-ns
+    ```
+
+    The controller generates a `NetworkPolicy` whose `podSelector` matches all pods in the namespace and whose ingress/egress peers are limited to the listed namespaces (matched via the `kubernetes.io/metadata.name` label).
+
+    <Tip>
+    Use `status.suggestedNamespaces` after a learning run to discover which namespaces actually communicate with your workload — then copy that list directly into `allowedNamespaces`.
+    </Tip>
+  </Tab>
+
+  <Tab title="allow + deniedNamespaces">
+    The `allow` type implements a **default-allow / deny-list** model. All namespace-to-namespace traffic is permitted by default; only namespaces listed in `deniedNamespaces` are blocked.
+
+    This is useful during initial migration when you cannot yet enumerate all legitimate callers, but still need to block specific known-bad namespaces.
+
+    ```yaml
+    apiVersion: security.policy.io/v1
+    kind: NetworkPolicyGenerator
+    metadata:
+      name: legacy-service-denylist
+      namespace: staging
+    spec:
+      mode: enforcing
+      policy:
+        type: allow
+        deniedNamespaces:
+          - untrusted-ns
+          - test-isolation
+    ```
+
+    The controller generates a `NetworkPolicy` whose ingress/egress peers use a `namespaceSelector` with `matchExpressions: [{key: kubernetes.io/metadata.name, operator: NotIn, values: [...]}]`.
+
+    <Warning>
+    The `allow` posture is permissive by design. If a namespace appears in both `allowedNamespaces` and `deniedNamespaces`, the API server rejects the resource with a CEL validation error.
+    </Warning>
+  </Tab>
+</Tabs>
+
+### Namespace label used for matching
+
+Both posture modes resolve namespace names through the label `kubernetes.io/metadata.name`, which Kubernetes automatically applies to every namespace. You do not need to add custom labels to namespaces — the standard label is always present on Kubernetes 1.21+.
+
+---
+
+## Global rules
+
+`spec.globalRules` is a list of up to 256 port-level rules applied to all pods matched by `spec.policy.podSelector`. Each rule controls traffic at a specific port/protocol/direction and is enforced against `0.0.0.0/0` (any IP address) in the given direction.
+
+### Structure of a global rule
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `type` | `allow` \| `deny` | ✅ | Whether to permit or block this port/direction. |
+| `port` | integer 1–65535 | either `port` or `namedPort` | Numeric port number. |
+| `namedPort` | string | either `port` or `namedPort` | Named port from pod/service spec. |
+| `protocol` | `TCP` \| `UDP` | ✅ | Transport protocol. |
+| `direction` | `ingress` \| `egress` | ✅ | Traffic direction this rule applies to. |
+
+<Warning>
+**CEL validation:** exactly one of `port` or `namedPort` must be set. Setting both or omitting both causes the API server to reject the resource at admission time with the message: *"exactly one of port or namedPort must be specified"*.
+</Warning>
+
+### Example: allow HTTP/HTTPS ingress plus DNS egress
+
+```yaml
+spec:
+  mode: enforcing
+  policy:
+    type: deny
+    allowedNamespaces:
+      - kube-system
+  globalRules:
+    - type: allow
+      port: 80
+      protocol: TCP
+      direction: ingress   # accept HTTP from any IP
+    - type: allow
+      port: 443
+      protocol: TCP
+      direction: ingress   # accept HTTPS from any IP
+    - type: allow
+      port: 53
+      protocol: UDP
+      direction: egress    # DNS resolution (also added automatically)
+    - type: allow
+      port: 53
+      protocol: TCP
+      direction: egress    # DNS over TCP fallback
+```
+
+### Example: API server with gRPC
+
+```yaml
+spec:
+  mode: enforcing
+  policy:
+    type: deny
+    allowedNamespaces:
+      - kube-system
+    podSelector:
+      app: api-server
+  globalRules:
+    - type: allow
+      port: 8080
+      protocol: TCP
+      direction: ingress
+    - type: allow
+      port: 8443
+      protocol: TCP
+      direction: ingress
+    - type: allow
+      port: 9090
+      protocol: TCP
+      direction: ingress   # gRPC / Prometheus metrics
+```
+
+---
+
+## CIDR rules
+
+`spec.cidrRules` (max 256 entries) governs traffic to and from specific IP address ranges outside the Kubernetes pod network — on-premises databases, external SaaS APIs, monitoring infrastructure, or any other CIDR you need to explicitly permit or restrict.
+
+### Structure of a CIDR rule
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `cidr` | string (CIDR) | ✅ | IP address range (e.g., `10.0.0.0/8`). |
+| `except` | string[] | — | Sub-ranges within `cidr` to exclude. |
+| `direction` | `ingress` \| `egress` | ✅ | Traffic direction. |
+
+### Example: egress to internal network with sub-range exclusion
+
+```yaml
+spec:
+  mode: enforcing
+  policy:
+    type: deny
+    allowedNamespaces:
+      - kube-system
+  cidrRules:
+    - cidr: "10.0.0.0/8"
+      direction: egress    # allow all internal network egress...
+    - cidr: "192.168.1.0/24"
+      except:
+        - "192.168.1.200/32"  # ...except this specific IP
+      direction: ingress
+    - cidr: "203.0.113.0/24"  # external API server
+      direction: egress
+  globalRules:
+    - type: allow
+      port: 443
+      protocol: TCP
+      direction: egress
+```
+
+### Example: database in a private subnet
+
+Allow only the specific `/24` subnet that hosts your database while blocking the rest of `10.0.0.0/8`:
+
+```yaml
+spec:
+  mode: enforcing
+  policy:
+    type: deny
+    allowedNamespaces:
+      - backend-ns
+    podSelector:
+      app: postgres
+  cidrRules:
+    - cidr: "10.0.0.0/8"
+      except:
+        - "10.1.0.0/16"   # block dev environment subnet
+        - "10.2.0.0/16"   # block staging subnet
+      direction: egress
+```
+
+<Note>
+CIDR rules are translated directly into `ipBlock` entries in the generated `NetworkPolicy`. The `except` list maps to the `except` field of the Kubernetes `IPBlock` object.
+</Note>
+
+---
+
+## Named ports
+
+Named ports allow you to reference a port by the **name** declared in the pod's container spec or Service, rather than its numeric value. This is useful when different pods expose the same logical service on different port numbers — the policy remains correct without hardcoding a number.
+
+### How named ports work
+
+When a global rule specifies `namedPort: "http"`, the generated policy uses an `IntOrString` port reference that Kubernetes resolves at enforcement time by looking up the target pod's container port named `http`.
+
+```yaml
+# Pod spec (for reference — not part of the CR)
+containers:
+  - name: app
+    ports:
+      - name: http
+        containerPort: 3000
+      - name: grpc
+        containerPort: 9000
+```
+
+```yaml
+# NetworkPolicyGenerator CR
+spec:
+  mode: enforcing
+  policy:
+    type: deny
+    allowedNamespaces:
+      - kube-system
+    podSelector:
+      app: api-server
+  globalRules:
+    - type: allow
+      namedPort: http    # resolves to port 3000 on the target pod
+      protocol: TCP
+      direction: ingress
+    - type: allow
+      namedPort: grpc    # resolves to port 9000 on the target pod
+      protocol: TCP
+      direction: ingress
+    - type: allow
+      namedPort: https
+      protocol: TCP
+      direction: egress
+```
+
+### Common named port values
+
+| Name | Typical port | Protocol |
+|---|---|---|
+| `http` | 80 or custom | TCP |
+| `https` | 443 | TCP |
+| `grpc` | 9000 or 50051 | TCP |
+| `metrics` | 9090 | TCP |
+| `dns` | 53 | UDP/TCP |
+
+<Tip>
+Use named ports when deploying to environments where different container images bind to different port numbers (e.g., JVM apps on 8080 vs. Go apps on 3000) but all expose the same port **name** in their container spec.
+</Tip>
+
+---
+
+## Automatic DNS egress
+
+All generated policies automatically include an egress rule that allows DNS resolution, regardless of whether you specify it manually. This prevents workloads from losing DNS lookups after a deny-all policy is applied.
+
+The auto-appended rule allows both **UDP/53** and **TCP/53** egress to `kube-system`:
+
+```go
+// from internal/policy/rules.go
+func dnsEgressRule() networkingv1.NetworkPolicyEgressRule {
+    udp := v1.ProtocolUDP
+    tcp := v1.ProtocolTCP
+    dnsPort := intstr.FromInt32(DNSPort) // DNSPort = 53
+
+    return networkingv1.NetworkPolicyEgressRule{
+        Ports: []networkingv1.NetworkPolicyPort{
+            {Protocol: &udp, Port: &dnsPort},
+            {Protocol: &tcp, Port: &dnsPort},
+        },
+    }
+}
+```
+
+This means:
+
+- You do **not** need to add a `port: 53` global rule manually.
+- If you add one anyway it is deduplicated during rule merging.
+- The DNS rule targets `kube-system` where CoreDNS runs by default.
+
+<Info>
+For Cilium policies the DNS rule uses `entity: world` and `toEndpoints` selectors targeting kube-dns pods, which is the idiomatic way to express DNS egress in the Cilium policy model.
+</Info>
+
+---
+
+## Rule precedence and deduplication
+
+When a `templateName` is set, template rules and user `globalRules` are merged. The deduplication key is `direction/protocol/port-or-namedPort`. User-defined rules always win:
+
+1. User rules are inserted first (highest priority).
+2. Template rules fill in any key not already defined by the user.
+3. Duplicate keys from the template are silently discarded.
+
+This means you can override a single template rule (e.g., change port 80 ingress) by adding your own rule with the same key, without touching the rest of the template.

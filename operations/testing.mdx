@@ -1,0 +1,770 @@
+---
+title: "Complete Testing Guide for Network Policy Generator"
+sidebarTitle: "Testing"
+description: "Run unit, integration, Helm chart, and E2E tests for Network Policy Generator, including per-engine test variants and manual verification workflows."
+---
+
+Network Policy Generator ships a comprehensive test suite that covers everything from fast unit tests backed by `envtest` all the way to full end-to-end validation on a real Kind cluster. Before running any live-cluster tests, deploy the controller with `make deploy`, which installs the CRD, RBAC manifests, and the controller manager in one shot using the image tag defined in the Makefile's `IMG` variable — no published image or release tag is required.
+
+## Prerequisites
+
+<CardGroup cols={2}>
+  <Card title="kubectl configured" icon="terminal">
+    A working `~/.kube/config` pointing at a reachable cluster is required for integration and Helm tests.
+  </Card>
+  <Card title="Kind installed" icon="box">
+    End-to-end tests use Kind (Kubernetes in Docker). Install with `go install sigs.k8s.io/kind@latest`.
+  </Card>
+  <Card title="Cilium CNI (optional)" icon="shield">
+    Required only for Cilium engine tests. The test suite will skip gracefully if CRDs are absent.
+  </Card>
+  <Card title="Calico CNI (optional)" icon="shield-halved">
+    Required only for Calico engine tests. The test suite will skip gracefully if CRDs are absent.
+  </Card>
+</CardGroup>
+
+---
+
+## Unit Tests
+
+Unit tests run entirely in-process using `envtest` (a local Kubernetes API server) — no live cluster is needed. The test target automatically runs `manifests`, `generate`, `fmt`, and `vet` before executing the suite and writes a coverage profile to `cover.out`.
+
+```bash
+make test
+```
+
+Coverage output lands in `cover.out` at the repo root. Inspect it with:
+
+```bash
+go tool cover -func cover.out
+go tool cover -html  cover.out   # open an HTML report in your browser
+```
+
+---
+
+## Integration Tests
+
+Integration tests apply real `NetworkPolicyGenerator` custom resources against a live cluster and verify that the controller reconciles them into the expected network policies. The suite calls `make deploy` internally, so the controller is deployed from your local source — no published image is needed.
+
+By default (`ENGINE=auto`) the script auto-detects which CNI CRDs are present on the cluster and runs the matching subset; you can override this with the `ENGINE` variable.
+
+<Tabs>
+  <Tab title="Auto-detect (default)">
+    ```bash
+    make test-integration
+    ```
+    Inspects the cluster for Cilium and Calico CRDs and enables the corresponding engines automatically.
+  </Tab>
+  <Tab title="Kubernetes only">
+    ```bash
+    make test-integration ENGINE=kubernetes
+    ```
+    Runs only the standard Kubernetes `NetworkPolicy` test cases (Tests A–D, K).
+  </Tab>
+  <Tab title="Cilium only">
+    ```bash
+    make test-integration ENGINE=cilium
+    ```
+    Runs Cilium `CiliumNetworkPolicy` test cases (Tests L–M). Requires Cilium CRDs installed.
+  </Tab>
+  <Tab title="Calico only">
+    ```bash
+    make test-integration ENGINE=calico
+    ```
+    Runs Calico `NetworkPolicy` test cases (Tests G–H). Requires Calico CRDs installed.
+  </Tab>
+  <Tab title="All engines">
+    ```bash
+    make test-integration ENGINE=all
+    ```
+    Forces all engine test cases regardless of whether the CNI CRDs are present. Engines whose CRDs are missing are skipped gracefully.
+  </Tab>
+</Tabs>
+
+---
+
+## Helm Chart Tests
+
+Helm chart tests validate the full chart lifecycle — lint, template render, package, install, upgrade, policy verification, and uninstall — against a live cluster. The chart is loaded from the local `./helm/network-policy-generator` path, so no chart release is required.
+
+**Coverage includes:**
+
+- `helm lint` and `helm template` render
+- Helm install and release verification
+- Controller pod, CRD, RBAC, and Service health checks
+- Kubernetes, Cilium, and Calico `NetworkPolicy` CR tests (same cases as integration)
+- Policy template tests (`web-app`, `database`, `backend-api`, `monitoring`)
+- Helm upgrade test
+- Helm uninstall and CRD cleanup hook verification
+
+<Tabs>
+  <Tab title="Auto-detect (default)">
+    ```bash
+    make test-helm
+    ```
+  </Tab>
+  <Tab title="Kubernetes only">
+    ```bash
+    make test-helm ENGINE=kubernetes
+    ```
+  </Tab>
+  <Tab title="Cilium only">
+    ```bash
+    make test-helm ENGINE=cilium
+    ```
+  </Tab>
+  <Tab title="Calico only">
+    ```bash
+    make test-helm ENGINE=calico
+    ```
+  </Tab>
+  <Tab title="All engines">
+    ```bash
+    make test-helm ENGINE=all
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## End-to-End Tests (Kind)
+
+E2E tests spin up the full controller stack inside Kind and exercise the operator through its public API. Prometheus and cert-manager are installed by default; set the skip flags below if your Kind cluster doesn't have them.
+
+```bash
+# Standard run
+make test-e2e
+
+# Skip optional add-ons
+PROMETHEUS_INSTALL_SKIP=true CERT_MANAGER_INSTALL_SKIP=true make test-e2e
+```
+
+<Note>
+  `make test-e2e` first checks that the `kind` binary is on your PATH **and** that a cluster named `kind` is already running. Create one with `kind create cluster` before executing this target.
+</Note>
+
+---
+
+## Manual Deploy & Verification
+
+Use the following steps when you want to apply individual sample CRs by hand and observe the controller's behavior in real time.
+
+<Steps>
+  <Step title="Deploy the controller">
+    Install the CRD, RBAC, and the controller manager in one command:
+
+    ```bash
+    make deploy
+    ```
+
+    Verify the pod is `Running`:
+
+    ```bash
+    kubectl get pods -n network-policy-generator-system
+    ```
+  </Step>
+
+  <Step title="Create test namespaces and pods">
+    The sample `test.yaml` creates nginx pods and services in three namespaces used by the test cases:
+
+    ```bash
+    kubectl create ns test-ns1
+    kubectl create ns test-ns2
+    kubectl create ns test-ns3
+
+    kubectl apply -f config/samples/test.yaml
+    ```
+
+    Wait for pods to be ready:
+
+    ```bash
+    kubectl get pods -n test-ns1
+    kubectl get pods -n test-ns2
+    kubectl get pods -n test-ns3
+    ```
+  </Step>
+
+  <Step title="Apply test CRs and verify">
+    Choose a test case from the sections below, apply it, and verify the expected resources are created. Each test section includes check and cleanup commands.
+  </Step>
+
+  <Step title="Full cleanup">
+    When finished, remove all test resources and undeploy the controller:
+
+    ```bash
+    kubectl delete -f config/samples/test.yaml --ignore-not-found
+    kubectl delete ns test-ns1 test-ns2 test-ns3 --ignore-not-found
+
+    make undeploy
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Test Cases Reference
+
+### Core Kubernetes NetworkPolicy Tests
+
+<Accordion title="Test A — Deny Policy (allow specific namespaces)">
+  Applies a deny policy that restricts ingress to traffic originating from specified namespaces only.
+
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-deny.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -n test-ns1
+  kubectl get networkpolicies -n test-ns1
+  kubectl describe networkpolicy -n test-ns1
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+<Accordion title="Test B — Allow Policy (deny specific namespaces)">
+  Applies an allow policy that selectively blocks traffic from specified namespaces.
+
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-allow.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -n test-ns1
+  kubectl get networkpolicies -n test-ns1
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+<Accordion title="Test C — Learning → Enforcing mode transition">
+  Creates a generator in `learning` mode with a 1-minute duration. After the duration elapses the controller transitions to `enforcing` and generates the `NetworkPolicy`.
+
+  ```yaml
+  apiVersion: security.policy.io/v1
+  kind: NetworkPolicyGenerator
+  metadata:
+    name: test-learning
+    namespace: test-ns1
+  spec:
+    mode: "learning"
+    duration: "1m"
+    policy:
+      type: "deny"
+      allowedNamespaces:
+        - "test-ns3"
+    globalRules:
+      - type: "allow"
+        port: 80
+        protocol: TCP
+        direction: "ingress"
+  ```
+
+  ```bash
+  kubectl apply -f - <<'EOF'
+  # (paste the YAML above)
+  EOF
+  ```
+
+  **Verify:**
+
+  ```bash
+  # Should show "Learning" phase immediately
+  kubectl get networkpolicygenerators -n test-ns1
+
+  # After 1 minute — should show "Enforcing"
+  kubectl get networkpolicygenerators -n test-ns1
+
+  # NetworkPolicy created after mode transition
+  kubectl get networkpolicies -n test-ns1
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+### Advanced Feature Tests
+
+<Accordion title="Test D-1 — Pod Label Selector">
+  Verifies that `spec.policy.podSelector` targets only matching pods.
+
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-pod-selector.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -n test-ns1
+  kubectl get networkpolicies -n test-ns1
+  kubectl get networkpolicy -n test-ns1 -o jsonpath='{.items[0].spec.podSelector.matchLabels}'
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+<Accordion title="Test D-2 — CIDR Rules">
+  Verifies that CIDR-based egress/ingress rules are rendered correctly in the generated policy.
+
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-cidr-rules.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -n test-ns1
+  kubectl get networkpolicies -n test-ns1
+  kubectl get networkpolicy -n test-ns1 -o yaml | grep -A5 cidr
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+<Accordion title="Test D-3 — Named Port">
+  Verifies that named ports (`http`, `grpc`) are resolved and included in the generated policy.
+
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-named-port.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -n test-ns1
+  kubectl get networkpolicies -n test-ns1
+  kubectl get networkpolicy -n test-ns1 -o yaml | grep -A2 port
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+<Accordion title="Test D-4 — Dry Run Mode">
+  In dry run mode the controller writes the generated policy spec to `status.generatedPolicies` but does **not** create a live `NetworkPolicy` object.
+
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-dry-run.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -n test-ns1
+
+  # No NetworkPolicy should exist
+  kubectl get networkpolicies -n test-ns1
+
+  # Generated spec is in status
+  kubectl get networkpolicygenerator dry-run-example -n test-ns1 \
+    -o jsonpath='{.status.generatedPolicies}'
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+<Accordion title="Test D-5 — Full Features (pod selector + CIDR + named port + diff)">
+  Exercises all advanced features together and verifies both `status.policyDiff` and `status.appliedPoliciesCount`.
+
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-full-features.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -n test-ns1
+  kubectl get networkpolicies -n test-ns1
+
+  kubectl get networkpolicygenerator full-features-example -n test-ns1 \
+    -o jsonpath='{.status.policyDiff}'
+
+  kubectl get networkpolicygenerator full-features-example -n test-ns1 \
+    -o jsonpath='{.status.appliedPoliciesCount}'
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+### Operational Feature Tests
+
+<Accordion title="Test D-6 — Event Recording">
+  Verifies that the controller emits `PolicyApplied`, `ModeTransition`, `PolicyDeleted`, and related Kubernetes Events.
+
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-deny.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get events -n test-ns1 \
+    --field-selector involvedObject.kind=NetworkPolicyGenerator
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+<Accordion title="Test D-7 — Prometheus Metrics">
+  Port-forwards the metrics service and checks that custom `npg_*` metrics are exposed.
+
+  ```bash
+  NAMESPACE="network-policy-generator-system"
+  METRICS_SVC="network-policy-generator-controller-manager-metrics-service"
+
+  kubectl port-forward -n "$NAMESPACE" "svc/${METRICS_SVC}" 18443:8443 &
+  PF_PID=$!
+  sleep 2
+
+  TOKEN=$(kubectl create token network-policy-generator-controller-manager -n "$NAMESPACE")
+  curl -sk -H "Authorization: Bearer ${TOKEN}" https://localhost:18443/metrics | grep npg_
+
+  kill $PF_PID
+  ```
+
+  Expected metrics: `npg_reconcile_total`, `npg_reconcile_duration_seconds`, `npg_policies_applied`, `npg_policy_operations_total`, `npg_generators_active`, `npg_dry_run_total`, `npg_validation_errors_total`.
+
+  <Note>
+    The controller pod uses a distroless base image and does not include `curl`. Use port-forwarding to the service and run `curl` from your local machine or a debug pod.
+  </Note>
+</Accordion>
+
+<Accordion title="Test D-8 — Webhook Validation">
+  Attempts to create a CR with an invalid `spec.mode` value. The admission webhook should reject it.
+
+  <Warning>
+    This test requires cert-manager to be installed and the controller to be started with `--enable-webhooks`.
+  </Warning>
+
+  ```bash
+  kubectl apply -f - <<'EOF'
+  apiVersion: security.policy.io/v1
+  kind: NetworkPolicyGenerator
+  metadata:
+    name: invalid-test
+    namespace: test-ns1
+  spec:
+    mode: "invalid"
+    policy:
+      type: "deny"
+  EOF
+  ```
+
+  **Expected result:** The webhook rejects the request with `Unsupported value: "invalid"`.
+</Accordion>
+
+### Calico Engine Tests
+
+<Accordion title="Test G — Calico Deny Policy">
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-calico-deny.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -n test-ns1
+  kubectl get networkpolicies.crd.projectcalico.org -n test-ns1
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+<Accordion title="Test H — Calico Allow Policy">
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-calico-allow.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -n test-ns1
+  kubectl get networkpolicies.crd.projectcalico.org -n test-ns1
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+### Policy Template Tests
+
+<Accordion title="Test I — Web-App Template (ports 80, 443)">
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-template-web-app.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -n test-ns1
+  kubectl get networkpolicies -n test-ns1
+  kubectl get networkpolicy -n test-ns1 -o yaml | grep -A2 port
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+<Accordion title="Test J — Database Template (ports 3306, 5432, 6379, 27017)">
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-template-database.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -n test-ns1
+  kubectl get networkpolicies -n test-ns1
+  kubectl get networkpolicy -n test-ns1 -o yaml | grep -A2 port
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+<Accordion title="Test J-2 — Backend API Template (ports 8080, 8443, 9090)">
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-template-backend-api.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -n test-ns1
+  kubectl get networkpolicies -n test-ns1
+  kubectl get networkpolicy -n test-ns1 -o yaml | grep -A2 port
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+<Accordion title="Test J-3 — Monitoring Template (ports 9090, 9100)">
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-template-monitoring.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -n test-ns1
+  kubectl get networkpolicies -n test-ns1
+  kubectl get networkpolicy -n test-ns1 -o yaml | grep -A2 port
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+### Learning Mode Suggestion Tests
+
+<Accordion title="Test K — Learning Mode with Suggestions">
+  Creates a short-lived learning generator (30 s) and inspects the `suggestedNamespaces` and `suggestedRules` populated in `status` after the transition to enforcing.
+
+  ```yaml
+  apiVersion: security.policy.io/v1
+  kind: NetworkPolicyGenerator
+  metadata:
+    name: test-learning-suggestions
+    namespace: test-ns1
+  spec:
+    mode: "learning"
+    duration: "30s"
+    policy:
+      type: "deny"
+  ```
+
+  ```bash
+  kubectl apply -f - <<'EOF'
+  # (paste the YAML above)
+  EOF
+  ```
+
+  **Verify:**
+
+  ```bash
+  # Immediately — should show "Learning" phase
+  kubectl get networkpolicygenerators -n test-ns1
+
+  sleep 35
+
+  # After duration — should show "Enforcing"
+  kubectl get networkpolicygenerators -n test-ns1
+
+  kubectl get networkpolicygenerator test-learning-suggestions -n test-ns1 \
+    -o jsonpath='{.status.suggestedNamespaces}'
+
+  kubectl get networkpolicygenerator test-learning-suggestions -n test-ns1 \
+    -o jsonpath='{.status.suggestedRules}'
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+### Cilium Engine Tests
+
+<Accordion title="Test L — Cilium Deny Policy">
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-cilium-deny.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -n test-ns1
+  kubectl get ciliumnetworkpolicies -n test-ns1
+  kubectl describe ciliumnetworkpolicy -n test-ns1
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+<Accordion title="Test M — Cilium Allow Policy">
+  ```bash
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-cilium-allow.yaml -n test-ns1
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -n test-ns1
+  kubectl get ciliumnetworkpolicies -n test-ns1
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+  ```
+</Accordion>
+
+### Multi-Namespace & Lifecycle Tests
+
+<Accordion title="Multi-Namespace Test (test-policy.yaml)">
+  Applies generators across multiple namespaces simultaneously.
+
+  ```bash
+  kubectl apply -f config/samples/test-policy.yaml
+  ```
+
+  **Verify:**
+
+  ```bash
+  kubectl get networkpolicygenerators -A
+  kubectl get networkpolicies -A
+  ```
+
+  **Cleanup:**
+
+  ```bash
+  kubectl delete networkpolicygenerators -A --all
+  ```
+</Accordion>
+
+<Accordion title="Finalizer / Deletion Test">
+  Verifies that deleting a `NetworkPolicyGenerator` also removes the generated `NetworkPolicy` objects (owner-reference cascade via finalizer).
+
+  ```bash
+  # Apply a policy
+  kubectl apply -f config/samples/security_v1_networkpolicygenerator-deny.yaml -n test-ns1
+
+  # Verify the NetworkPolicy exists
+  kubectl get networkpolicies -n test-ns1
+
+  # Delete the generator
+  kubectl delete networkpolicygenerators -n test-ns1 --all
+
+  # The NetworkPolicy should be gone
+  kubectl get networkpolicies -n test-ns1
+  ```
+</Accordion>
+
+---
+
+## Sample Files Reference
+
+| File | Engine | Policy Type | Description |
+|------|--------|-------------|-------------|
+| `security_v1_networkpolicygenerator.yaml` | kubernetes | deny | Basic deny policy with global rules |
+| `security_v1_networkpolicygenerator-allow.yaml` | kubernetes | allow | Allow policy — deny specific namespaces |
+| `security_v1_networkpolicygenerator-deny.yaml` | kubernetes | deny | Deny policy — allow specific namespaces |
+| `security_v1_networkpolicygenerator-pod-selector.yaml` | kubernetes | deny | Pod label selector targeting |
+| `security_v1_networkpolicygenerator-cidr-rules.yaml` | kubernetes | deny | CIDR-based egress/ingress rules |
+| `security_v1_networkpolicygenerator-named-port.yaml` | kubernetes | deny | Named port (`http`, `grpc`) rules |
+| `security_v1_networkpolicygenerator-dry-run.yaml` | kubernetes | deny | Dry run mode (preview only) |
+| `security_v1_networkpolicygenerator-full-features.yaml` | kubernetes | deny | All features combined |
+| `security_v1_networkpolicygenerator-cilium-allow.yaml` | cilium | allow | Cilium allow policy |
+| `security_v1_networkpolicygenerator-cilium-deny.yaml` | cilium | deny | Cilium deny policy |
+| `security_v1_networkpolicygenerator-calico-allow.yaml` | calico | allow | Calico allow policy |
+| `security_v1_networkpolicygenerator-calico-deny.yaml` | calico | deny | Calico deny policy |
+| `security_v1_networkpolicygenerator-template-web-app.yaml` | kubernetes | deny | Web-app template (80, 443) |
+| `security_v1_networkpolicygenerator-template-database.yaml` | kubernetes | deny | Database template (3306, 5432, 6379, 27017) |
+| `security_v1_networkpolicygenerator-template-backend-api.yaml` | kubernetes | deny | Backend API template (8080, 8443, 9090) |
+| `security_v1_networkpolicygenerator-template-monitoring.yaml` | kubernetes | deny | Monitoring template (9090, 9100) |
+| `test.yaml` | — | — | Test pods (nginx) and services |
+| `test-policy.yaml` | kubernetes | deny | Multi-namespace test |

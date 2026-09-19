@@ -1,0 +1,256 @@
+---
+title: "Generating Native Kubernetes NetworkPolicies"
+sidebarTitle: "Kubernetes Policies"
+description: "Step-by-step guide for generating standard Kubernetes NetworkPolicies with allow and deny approaches, pod-label targeting, and the learning-to-enforcing workflow."
+---
+
+The `kubernetes` policy engine is the default backend for Network Policy Generator. It produces standard `networking.k8s.io/v1` NetworkPolicy objects that every conformant Kubernetes distribution understands — no additional CNI plugins required. You choose whether the operator should **block traffic from specific namespaces** (allow policy type) or **permit traffic only from an explicit allowlist** (deny policy type), add global port rules on top, and the operator handles creating, updating, and garbage-collecting the generated NetworkPolicy objects on your behalf.
+
+## Prerequisites
+
+<CardGroup cols={2}>
+  <Card title="Kubernetes v1.25+" icon="server">
+    NetworkPolicy enforcement requires a CNI plugin that honours the standard API — e.g. Calico, Cilium, Flannel with Kube-router, or Weave Net.
+  </Card>
+  <Card title="Operator installed" icon="gear">
+    The `NetworkPolicyGenerator` CRD and controller must be running in your cluster before applying any generator resources.
+  </Card>
+</CardGroup>
+
+<Note>
+  Omitting `spec.policyEngine` or setting it to `kubernetes` selects this engine. Both are equivalent.
+</Note>
+
+---
+
+## Allow vs. Deny — Policy Types
+
+<Tabs>
+  <Tab title="Allow policy (block specific namespaces)">
+    An **allow** policy type works by listing namespaces whose traffic should be **blocked**. The operator generates one NetworkPolicy per listed namespace and places it inside that namespace so every workload there is isolated from the generator's target pods. All other namespaces continue to communicate normally.
+
+    Use this approach when you have a small set of untrusted or development namespaces you want to fence off.
+
+    ```yaml
+    apiVersion: security.policy.io/v1
+    kind: NetworkPolicyGenerator
+    metadata:
+      name: test-policy-generator-allow
+      labels:
+        app.kubernetes.io/name: network-policy-generator
+        app.kubernetes.io/managed-by: kustomize
+    spec:
+      mode: "enforcing"
+
+      policy:
+        type: "allow"
+        deniedNamespaces:       # traffic from these namespaces is blocked
+          - "test-ns1"
+          - "test-ns2"
+
+      globalRules:
+        - type: "allow"
+          port: 80
+          protocol: TCP
+          direction: "ingress"
+        - type: "allow"
+          port: 443
+          protocol: TCP
+          direction: "egress"
+    ```
+
+    **What the operator generates:** one `NetworkPolicy` resource in each `deniedNamespace` that explicitly denies ingress and egress to/from pods matching the (optional) pod selector, while the global rules punch open TCP/80 ingress and TCP/443 egress for all pods in those namespaces.
+  </Tab>
+
+  <Tab title="Deny policy (allowlist namespaces)">
+    A **deny** policy type works by listing the namespaces whose traffic should be **permitted**. The operator generates a single NetworkPolicy in the generator's own namespace that allows ingress and egress only from the listed namespaces, implicitly dropping everything else.
+
+    Use this approach for a default-deny posture where only named trusted namespaces can reach your workloads.
+
+    ```yaml
+    apiVersion: security.policy.io/v1
+    kind: NetworkPolicyGenerator
+    metadata:
+      name: test-policy-generator-deny
+      labels:
+        app.kubernetes.io/name: network-policy-generator
+        app.kubernetes.io/managed-by: kustomize
+    spec:
+      mode: "enforcing"
+
+      policy:
+        type: "deny"
+        allowedNamespaces:      # only traffic from these namespaces is permitted
+          - "test-ns1"
+          - "test-ns2"
+
+      globalRules:
+        - type: "allow"
+          port: 80
+          protocol: TCP
+          direction: "ingress"
+        - type: "allow"
+          port: 443
+          protocol: TCP
+          direction: "egress"
+    ```
+
+    **What the operator generates:** a single `NetworkPolicy` in the namespace where the `NetworkPolicyGenerator` lives. Its `ingress` and `egress` rules reference each allowed namespace by label selector (`kubernetes.io/metadata.name`), and the global rules add open ports on top.
+  </Tab>
+</Tabs>
+
+<Warning>
+  A namespace cannot appear in both `allowedNamespaces` and `deniedNamespaces` simultaneously. The CRD validation webhook will reject such a resource.
+</Warning>
+
+---
+
+## Targeting Specific Pods with `podSelector`
+
+By default a generated NetworkPolicy's `spec.podSelector` is empty, meaning it applies to **all pods** in the target namespace. To restrict the policy to a subset of pods, set `spec.policy.podSelector` with one or more label key-value pairs:
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: pod-selector-example
+  labels:
+    app.kubernetes.io/name: network-policy-generator
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  mode: "enforcing"
+
+  policy:
+    type: "deny"
+    allowedNamespaces:
+      - "monitoring"
+      - "logging"
+    podSelector:               # restrict policy to pods with these labels
+      app: "web"
+      tier: "frontend"
+
+  globalRules:
+    - type: "allow"
+      port: 80
+      protocol: TCP
+      direction: "ingress"
+    - type: "allow"
+      port: 443
+      protocol: TCP
+      direction: "egress"
+```
+
+The operator passes the map directly to `spec.podSelector.matchLabels` of the resulting NetworkPolicy, so only pods carrying **both** `app=web` and `tier=frontend` labels are affected. All other pods in the same namespace remain unaffected.
+
+---
+
+## Learning Mode → Enforcing Mode Workflow
+
+Running in `learning` mode first lets the operator observe live traffic patterns before you commit to a policy. This prevents accidentally dropping legitimate traffic on day one.
+
+<Steps>
+  <Step title="Deploy a learning-mode generator">
+    Create a `NetworkPolicyGenerator` with `mode: learning` and a positive `duration`. The `duration` field tells the controller how long to watch traffic before it transitions automatically.
+
+    ```yaml
+    apiVersion: security.policy.io/v1
+    kind: NetworkPolicyGenerator
+    metadata:
+      name: my-app-generator
+    spec:
+      mode: "learning"
+      duration: "10m"         # observe for 10 minutes, then transition
+
+      policy:
+        type: "deny"
+        allowedNamespaces: []
+    ```
+  </Step>
+
+  <Step title="Watch the status for suggested namespaces and rules">
+    While learning, the operator populates `status.suggestedNamespaces` and `status.suggestedRules` based on observed traffic:
+
+    ```bash
+    kubectl get networkpolicygenerator my-app-generator \
+      -o jsonpath='{.status.suggestedNamespaces}' | jq .
+
+    kubectl get networkpolicygenerator my-app-generator \
+      -o jsonpath='{.status.suggestedRules}' | jq .
+    ```
+  </Step>
+
+  <Step title="Transition to enforcing mode">
+    Once the learning duration elapses the controller transitions automatically. You can also patch the mode manually at any time:
+
+    ```bash
+    kubectl patch networkpolicygenerator my-app-generator \
+      --type=merge \
+      -p '{"spec":{"mode":"enforcing","policy":{"allowedNamespaces":["monitoring","logging"]}}}'
+    ```
+  </Step>
+
+  <Step title="Verify the generated NetworkPolicy">
+    After the controller reconciles in enforcing mode, a `NetworkPolicy` named `<generator-name>-generated` appears in the target namespace:
+
+    ```bash
+    kubectl get networkpolicy -A | grep generated
+
+    kubectl describe networkpolicy my-app-generator-generated \
+      -n <your-namespace>
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Inspecting Generated NetworkPolicy Objects
+
+Once enforcing mode is active, use standard `kubectl` commands to examine every aspect of the generated policies.
+
+### List all generated policies
+
+```bash
+# List all NetworkPolicies cluster-wide with their ages
+kubectl get networkpolicy -A
+
+# Filter to generator-managed policies only (suffix: -generated)
+kubectl get networkpolicy -A | grep '\-generated'
+```
+
+### Inspect a specific policy
+
+```bash
+# Full YAML dump
+kubectl get networkpolicy test-policy-generator-allow-generated \
+  -n test-ns1 -o yaml
+
+# Human-readable summary with ingress/egress rule breakdown
+kubectl describe networkpolicy test-policy-generator-allow-generated \
+  -n test-ns1
+```
+
+### Check the generator's status
+
+```bash
+# View phase, appliedPoliciesCount, and policyDiff
+kubectl get networkpolicygenerator test-policy-generator-allow \
+  -o jsonpath='{.status}' | jq .
+```
+
+### View Kubernetes Events
+
+```bash
+kubectl describe networkpolicygenerator test-policy-generator-allow
+```
+
+The `Events` section at the bottom shows `PolicyCreated`, `PolicyUpdated`, and any `ApplyFailed` entries emitted during reconciliation.
+
+---
+
+## DNS Egress Rule
+
+Every generated Kubernetes NetworkPolicy automatically includes an egress rule that permits UDP and TCP traffic to port 53 (`kube-dns`). This ensures pods can continue to resolve DNS names even under a strict deny-all egress policy. The rule is added unconditionally by the Kubernetes engine — you do not need to specify it in `globalRules`.
+
+<Tip>
+  If you later switch a generator's `policyEngine` from `kubernetes` to `cilium` or `calico`, delete any existing NetworkPolicy objects first to avoid stale policies from the previous engine coexisting with new ones.
+</Tip>

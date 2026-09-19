@@ -1,0 +1,280 @@
+---
+title: "Generating Calico NetworkPolicies with the Operator"
+sidebarTitle: "Calico Policies"
+description: "Complete guide for generating Calico NetworkPolicy resources using the calico engine, including allow/deny modes, selector expressions, and automatic DNS rules."
+---
+
+Setting `spec.policyEngine: calico` switches Network Policy Generator to the Calico backend. Instead of standard Kubernetes `networking.k8s.io/v1` NetworkPolicy objects, the operator emits `crd.projectcalico.org/v1` NetworkPolicy resources that are native to Calico and unlock Calico-specific capabilities such as ordered policy precedence, `projectcalico.org/name` namespace selectors, and explicit `Allow`/`Deny` actions per rule. The operator constructs every selector expression, order value, and DNS egress rule automatically — you only need to declare intent in the `NetworkPolicyGenerator` spec.
+
+<Warning>
+  **Calico CNI must be installed and running in your cluster before applying a `NetworkPolicyGenerator` with `policyEngine: calico`.** The `crd.projectcalico.org/v1` CustomResourceDefinition must exist, otherwise the operator cannot persist the generated resources and will emit an `ApplyFailed` event. Install Calico through its [official operator or manifest](https://docs.tigera.io/calico/latest/getting-started/kubernetes/) before proceeding.
+</Warning>
+
+---
+
+## How the Calico Engine Builds Selectors
+
+The Calico engine uses two internal helper functions to translate the `NetworkPolicyGenerator` spec into Calico selector expressions:
+
+<Accordion title="buildCalicoSelector — pod label map to Calico selector string">
+  When `spec.policy.podSelector` contains label key-value pairs, the engine converts them into a Calico selector expression by joining `key == 'value'` predicates with `&&`:
+
+  ```go
+  // Input: {"app": "web", "tier": "frontend"}
+  // Output: "app == 'web' && tier == 'frontend'"
+  ```
+
+  This string is placed in `spec.selector` of the generated `CalicoNetworkPolicy`. When `podSelector` is empty, the selector defaults to `all()`, which matches every endpoint in the namespace.
+</Accordion>
+
+<Accordion title="buildCalicoNamespaceSelector — namespace list to Calico namespace selector">
+  Namespace lists in `allowedNamespaces` or `deniedNamespaces` are converted to Calico namespace selector expressions using the `projectcalico.org/name` label:
+
+  ```go
+  // Single namespace:
+  // Output: "projectcalico.org/name == 'monitoring'"
+
+  // Multiple namespaces:
+  // Output: "projectcalico.org/name in { 'test-ns1', 'test-ns2' }"
+  ```
+
+  These expressions populate the `source.namespaceSelector` (ingress rules) and `destination.namespaceSelector` (egress rules) fields of the generated Calico rules.
+</Accordion>
+
+All generated Calico policies receive `spec.order: 100` (the `CalicoDefaultOrder` constant), which sets their precedence relative to any other Calico policies you may have defined manually. Lower order values take precedence in Calico's evaluation model.
+
+---
+
+## Allow-Based Calico NetworkPolicy
+
+An **allow** policy type (`spec.policy.type: allow`) generates `Deny` rules in Calico targeting the listed `deniedNamespaces`. The operator creates one `CalicoNetworkPolicy` per denied namespace and places it inside that namespace.
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: test-calico-allow
+spec:
+  mode: "enforcing"
+  policyEngine: "calico"
+
+  policy:
+    type: "allow"
+    deniedNamespaces:          # ingress/egress from these namespaces is denied
+      - "test-ns1"
+      - "test-ns2"
+
+  globalRules:
+    - type: "allow"
+      port: 80
+      protocol: TCP
+      direction: "ingress"
+    - type: "allow"
+      port: 443
+      protocol: TCP
+      direction: "egress"
+```
+
+For each denied namespace the operator creates a `CalicoNetworkPolicy` with:
+
+```yaml
+spec:
+  order: 100
+  selector: all()
+  types: ["Ingress", "Egress"]
+  ingress:
+    - action: Deny
+      source:
+        namespaceSelector: "projectcalico.org/name in { 'test-ns1', 'test-ns2' }"
+  egress:
+    - action: Deny
+      destination:
+        namespaceSelector: "projectcalico.org/name in { 'test-ns1', 'test-ns2' }"
+    - action: Allow          # automatic DNS egress rule
+      protocol: UDP
+      destination:
+        namespaceSelector: "projectcalico.org/name == 'kube-system'"
+        selector: "k8s-app == 'kube-dns'"
+        ports: [53]
+    - action: Allow          # global rule: TCP/80 ingress
+      protocol: TCP
+      destination:
+        ports: ["80"]
+```
+
+---
+
+## Deny-Based Calico NetworkPolicy
+
+A **deny** policy type (`spec.policy.type: deny`) generates `Allow` rules targeting only the listed `allowedNamespaces`. A single `CalicoNetworkPolicy` is created in the generator's own namespace. All traffic not matched by an allow rule is implicitly dropped once the policy exists.
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: test-calico-deny
+spec:
+  mode: "enforcing"
+  policyEngine: "calico"
+
+  policy:
+    type: "deny"
+    allowedNamespaces:         # only traffic from this namespace is permitted
+      - "test-ns3"
+
+  globalRules:
+    - type: "allow"
+      port: 80
+      protocol: TCP
+      direction: "ingress"
+    - type: "allow"
+      port: 443
+      protocol: TCP
+      direction: "egress"
+```
+
+The resulting `CalicoNetworkPolicy` will look like:
+
+```yaml
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: test-calico-deny-generated
+  namespace: <generator-namespace>
+spec:
+  order: 100
+  selector: all()
+  types: ["Ingress", "Egress"]
+  ingress:
+    - action: Allow
+      source:
+        namespaceSelector: "projectcalico.org/name == 'test-ns3'"
+    - action: Allow              # global rule: TCP/80 ingress
+      protocol: TCP
+      destination:
+        ports: ["80"]
+  egress:
+    - action: Allow
+      destination:
+        namespaceSelector: "projectcalico.org/name == 'test-ns3'"
+    - action: Allow              # automatic DNS egress rule
+      protocol: UDP
+      destination:
+        namespaceSelector: "projectcalico.org/name == 'kube-system'"
+        selector: "k8s-app == 'kube-dns'"
+        ports: [53]
+    - action: Allow              # global rule: TCP/443 egress
+      protocol: TCP
+      destination:
+        ports: ["443"]
+```
+
+---
+
+## Automatic DNS Egress Rule
+
+The Calico engine unconditionally appends a DNS egress rule to every generated `CalicoNetworkPolicy` immediately after the namespace-based rules are constructed and before global rules are applied. The rule allows UDP traffic to port 53 for the `kube-dns` service in `kube-system`:
+
+```yaml
+# Automatically injected — no configuration required
+- action: Allow
+  protocol: UDP
+  destination:
+    namespaceSelector: "projectcalico.org/name == 'kube-system'"
+    selector: "k8s-app == 'kube-dns'"
+    ports: [53]
+```
+
+This guarantees DNS resolution continues to work even under strict egress policies, without you needing to add a manual `globalRule`.
+
+---
+
+## Named Ports and CIDR Rules
+
+<Tabs>
+  <Tab title="Named ports">
+    Use `namedPort` in `globalRules` to reference a port by its service name. The Calico engine passes the string value directly to the `destination.ports` array in the generated rule:
+
+    ```yaml
+    globalRules:
+      - type: "allow"
+        namedPort: "https"
+        protocol: TCP
+        direction: "egress"
+    ```
+  </Tab>
+
+  <Tab title="CIDR rules">
+    `cidrRules` map to Calico's `source.nets`/`destination.nets` entity rule fields. The optional `except` list populates `notNets`:
+
+    ```yaml
+    cidrRules:
+      - cidr: "10.0.0.0/8"
+        direction: "egress"
+      - cidr: "192.168.1.0/24"
+        except:
+          - "192.168.1.200/32"
+        direction: "ingress"
+    ```
+
+    The generated Calico rule for the ingress entry:
+
+    ```yaml
+    - action: Allow
+      source:
+        nets: ["192.168.1.0/24"]
+        notNets: ["192.168.1.200/32"]
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Verifying Generated Calico Policies
+
+Use the Calico-specific resource API to inspect what the operator has created:
+
+```bash
+# List all Calico NetworkPolicies across all namespaces
+kubectl get networkpolicies.crd.projectcalico.org -A
+
+# Inspect a specific generated policy
+kubectl get networkpolicies.crd.projectcalico.org \
+  test-calico-allow-generated \
+  -n test-ns1 -o yaml
+
+# Check generator status (phase, appliedPoliciesCount, policyDiff)
+kubectl get networkpolicygenerator test-calico-allow \
+  -o jsonpath='{.status}' | jq .
+
+# View reconciliation events
+kubectl describe networkpolicygenerator test-calico-allow
+```
+
+<Note>
+  Calico's resource name for its NetworkPolicy CRD is `networkpolicies.crd.projectcalico.org`. Running plain `kubectl get networkpolicy` will show standard Kubernetes NetworkPolicies, not Calico ones.
+</Note>
+
+---
+
+## Pod Selector with Calico
+
+Combine `spec.policy.podSelector` with the Calico engine to restrict the generated policy to specific pods. The selector map is converted to a Calico expression string placed in `spec.selector`:
+
+```yaml
+spec:
+  policyEngine: "calico"
+  policy:
+    type: "deny"
+    allowedNamespaces:
+      - "monitoring"
+    podSelector:
+      app: "web"
+      tier: "frontend"
+```
+
+This produces `selector: "app == 'web' && tier == 'frontend'"` in the Calico policy spec, targeting only pods that carry both labels.
+
+<Tip>
+  If you have existing hand-crafted Calico policies with a lower `order` value than `100`, they will take precedence over the operator-generated policies. Adjust your existing policies' order values or set a custom order in a dedicated `GlobalNetworkPolicy` if conflicts arise.
+</Tip>

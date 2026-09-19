@@ -1,20 +1,90 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "Network Policy Generator: Auto-generate Kubernetes NetworkPolicies"
+sidebarTitle: "Home"
+description: "Network Policy Generator is a Kubernetes operator that auto-generates NetworkPolicies from observed traffic patterns, supporting learning/enforcing modes and Kubernetes, Cilium, and Calico CNIs."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+Network Policy Generator is a Kubernetes operator that eliminates the manual effort of writing NetworkPolicies. It observes real cluster traffic in **learning mode** to build data-driven policy recommendations, then applies them automatically in **enforcing mode** — across native Kubernetes, Cilium, and Calico CNI backends.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Deploy via Helm, kubectl, or build from source in minutes.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Create your first NetworkPolicyGenerator resource and verify policies are applied.
+  </Card>
+  <Card title="Core Concepts" icon="lightbulb" href="/concepts/how-it-works">
+    Understand the learning/enforcing lifecycle and how the operator works.
+  </Card>
+  <Card title="API Reference" icon="code" href="/reference/api-spec">
+    Full CRD spec for NetworkPolicyGenerator — every field documented.
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Learning Mode" icon="graduation-cap" href="/concepts/operating-modes">
+    Analyze live cluster traffic to discover namespace and rule suggestions before enforcing any policy.
+  </Card>
+  <Card title="Multi-CNI Support" icon="network-wired" href="/concepts/policy-engines">
+    Generate native policies for Kubernetes NetworkPolicy, Cilium CiliumNetworkPolicy, and Calico NetworkPolicy.
+  </Card>
+  <Card title="Built-in Templates" icon="layer-group" href="/configuration/templates">
+    Apply zero-trust, web-app, backend-api, database, or monitoring templates with a single field.
+  </Card>
+  <Card title="Dry Run Mode" icon="eye" href="/guides/advanced-features">
+    Preview generated policies in the resource status without applying them to your cluster.
+  </Card>
+  <Card title="CIDR Rules" icon="shield-halved" href="/configuration/policy-rules">
+    Define ingress/egress rules for external IP ranges with optional exception CIDR blocks.
+  </Card>
+  <Card title="Prometheus Metrics" icon="chart-line" href="/guides/monitoring">
+    Track reconcile counts, durations, active generators, and policy operations out of the box.
+  </Card>
+</CardGroup>
+
+## Get Up and Running
+
+<Steps>
+  <Step title="Install the operator">
+    Deploy Network Policy Generator into your cluster using Helm or a single `kubectl apply`.
+
+    ```bash
+    helm install npg oci://ghcr.io/somaz94/charts/network-policy-generator \
+      --version 0.4.0 \
+      --namespace npg-system --create-namespace
+    ```
+  </Step>
+  <Step title="Create a NetworkPolicyGenerator resource">
+    Apply a `NetworkPolicyGenerator` CR to start learning traffic patterns in a namespace.
+
+    ```yaml
+    apiVersion: security.policy.io/v1
+    kind: NetworkPolicyGenerator
+    metadata:
+      name: my-app-policy
+      namespace: default
+    spec:
+      mode: learning
+      duration: 5m
+      policy:
+        type: deny
+        allowedNamespaces:
+          - kube-system
+    ```
+  </Step>
+  <Step title="Transition to enforcing">
+    After the learning duration elapses, the operator transitions automatically to enforcing mode and applies the generated NetworkPolicies.
+  </Step>
+  <Step title="Verify policies">
+    ```bash
+    kubectl get networkpolicygenerator
+    kubectl get networkpolicy -A
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Network Policy Generator requires Kubernetes v1.25+ for CEL validation rules in the CRD. For Cilium or Calico policies, the respective CNI must be installed in your cluster.
+</Note>

@@ -1,0 +1,384 @@
+---
+title: "CRD Validation Rules for NetworkPolicyGenerator"
+sidebarTitle: "CRD Validation"
+description: "All CEL and webhook validation rules for NetworkPolicyGenerator: error messages, triggers, and remediation steps for every enforced constraint."
+---
+
+`NetworkPolicyGenerator` validation is split across two layers that each run at different times in the request lifecycle. CEL rules are embedded directly in the CRD schema and evaluated inside the API server — they require no webhook and fire on every create or update operation regardless of operator health. The optional validating webhook adds a second pass with richer cross-field logic and CIDR string parsing that CEL alone cannot express within the apiserver cost budget. Understanding both layers helps you diagnose admission rejections quickly and write correct manifests the first time.
+
+## Validation Architecture
+
+```text
+kubectl apply → API Server
+                   │
+                   ├─ OpenAPI schema checks (enum, type, maxItems, …)
+                   │
+                   ├─ CEL rules embedded in CRD (x-kubernetes-validations)
+                   │
+                   └─ Validating Webhook  ← optional (--enable-webhooks)
+                        │
+                        ├─ validateMode
+                        ├─ validatePolicyType
+                        ├─ validatePolicyEngine
+                        ├─ validateNamespaceOverlap
+                        ├─ validateGlobalRules
+                        └─ validateCIDRRules
+```
+
+<Note>
+  CEL rules run even when the webhook is disabled. The webhook is disabled by
+  default (`--enable-webhooks=false`) and must be opted into explicitly. Both
+  layers enforce overlapping rules so there is defence-in-depth when the webhook
+  is active.
+</Note>
+
+---
+
+## CEL Validation Rules
+
+CEL rules are embedded under `x-kubernetes-validations` in the CRD schema. They are evaluated by the Kubernetes API server at admission time with zero round-trips to the operator pod.
+
+### Rules Summary
+
+| Rule ID | Scope | CEL expression | Error message |
+|---------|-------|---------------|---------------|
+| CEL-1 | `spec` | `self.mode != 'learning' \|\| (has(self.duration) && duration(self.duration) > duration('0s'))` | `spec.duration is required and must be positive when mode is 'learning'` |
+| CEL-2 | `spec.policy` | `!has(self.allowedNamespaces) \|\| !has(self.deniedNamespaces) \|\| !self.allowedNamespaces.exists(n, n in self.deniedNamespaces)` | `a namespace cannot be listed in both allowedNamespaces and deniedNamespaces` |
+| CEL-3 | `spec.globalRules[*]` | `has(self.port) != has(self.namedPort)` | `exactly one of port or namedPort must be specified` |
+
+<Accordion title="CEL-1 — spec.duration required and positive in learning mode">
+**Scope:** `spec` object
+
+**Expression:**
+```cel
+self.mode != 'learning' || (has(self.duration) && duration(self.duration) > duration('0s'))
+```
+
+**What triggers it:**
+- `spec.mode: learning` with `spec.duration` omitted
+- `spec.mode: learning` with `spec.duration: "0s"` (zero duration)
+- `spec.mode: learning` with a negative duration string
+
+**Error returned:**
+```text
+spec.duration is required and must be positive when mode is 'learning'
+```
+
+**How to fix it:**
+
+Set a positive Go duration on `spec.duration` whenever `spec.mode` is `learning`:
+
+```yaml
+spec:
+  mode: learning
+  duration: "30m"   # ✅ positive — 30 minutes of traffic observation
+  policy:
+    type: deny
+```
+
+If you want to go directly to policy enforcement without a learning phase, set `mode: enforcing` and omit `duration`:
+
+```yaml
+spec:
+  mode: enforcing   # ✅ duration not required
+  policy:
+    type: deny
+```
+</Accordion>
+
+<Accordion title="CEL-2 — namespace cannot appear in both allowed and denied lists">
+**Scope:** `spec.policy` object
+
+**Expression:**
+```cel
+!has(self.allowedNamespaces) || !has(self.deniedNamespaces) ||
+!self.allowedNamespaces.exists(n, n in self.deniedNamespaces)
+```
+
+**What triggers it:**
+
+Any namespace string that appears in both `spec.policy.allowedNamespaces` and `spec.policy.deniedNamespaces` simultaneously.
+
+```yaml
+# ❌ This is rejected — "monitoring" appears in both lists
+spec:
+  policy:
+    type: deny
+    allowedNamespaces:
+      - kube-system
+      - monitoring      # ← conflict
+    deniedNamespaces:
+      - monitoring      # ← conflict
+```
+
+**Error returned:**
+```text
+a namespace cannot be listed in both allowedNamespaces and deniedNamespaces
+```
+
+**How to fix it:**
+
+Each namespace must appear in at most one of the two lists. Decide the intended disposition and remove the conflicting entry:
+
+```yaml
+spec:
+  policy:
+    type: deny
+    allowedNamespaces:
+      - kube-system
+      - monitoring      # ✅ only in allowedNamespaces
+```
+</Accordion>
+
+<Accordion title="CEL-3 — exactly one of port or namedPort per globalRule">
+**Scope:** Each element of `spec.globalRules[]`
+
+**Expression:**
+```cel
+has(self.port) != has(self.namedPort)
+```
+
+This XOR-style CEL expression rejects entries where both fields are present or neither is present.
+
+**What triggers it:**
+- Both `port` and `namedPort` set in the same rule entry
+- Neither `port` nor `namedPort` set in a rule entry
+
+```yaml
+# ❌ Both set — rejected
+globalRules:
+  - type: allow
+    port: 8080
+    namedPort: "http"   # conflict
+    protocol: TCP
+    direction: ingress
+
+# ❌ Neither set — rejected
+globalRules:
+  - type: allow
+    protocol: TCP
+    direction: ingress
+```
+
+**Error returned:**
+```text
+exactly one of port or namedPort must be specified
+```
+
+**How to fix it:**
+
+Use either a numeric `port` or a string `namedPort` — never both, never neither:
+
+```yaml
+# ✅ Numeric port
+globalRules:
+  - type: allow
+    port: 8080
+    protocol: TCP
+    direction: ingress
+
+# ✅ Named port
+globalRules:
+  - type: allow
+    namedPort: "http"
+    protocol: TCP
+    direction: ingress
+```
+</Accordion>
+
+---
+
+## Webhook Validation Rules
+
+The validating webhook is registered at path `/validate-security-policy-io-v1-networkpolicygenerator` and fires on `CREATE` and `UPDATE` operations when `--enable-webhooks=true`. Validation failures return HTTP 400 and the error message is surfaced directly in the `kubectl apply` output.
+
+<Warning>
+  The webhook requires TLS certificates to be available at the standard controller-runtime
+  webhook server path. Use cert-manager or provide certificates manually before enabling
+  `--enable-webhooks`. If the webhook pod is unavailable and `failurePolicy: Fail` is set,
+  **all** creates and updates to `NetworkPolicyGenerator` will be rejected.
+</Warning>
+
+### Webhook Rules Summary
+
+| Rule | Function | Trigger | Error message |
+|------|----------|---------|---------------|
+| W-1 | `validateMode` | Invalid `spec.mode` value | `spec.mode must be 'learning' or 'enforcing', got "…"` |
+| W-2 | `validateMode` | `mode=learning` with zero/missing duration | `spec.duration is required and must be positive when mode is 'learning'` |
+| W-3 | `validatePolicyType` | Invalid `spec.policy.type` | `spec.policy.type must be 'allow' or 'deny', got "…"` |
+| W-4 | `validatePolicyEngine` | Invalid `spec.policyEngine` | `spec.policyEngine must be 'kubernetes', 'cilium', or 'calico', got "…"` |
+| W-5 | `validateNamespaceOverlap` | Namespace in both allowed and denied | `namespace "…" cannot be both allowed and denied` |
+| W-6 | `validateGlobalRules` | Neither port nor namedPort set | `spec.globalRules[N]: either port or namedPort must be specified` |
+| W-7 | `validateGlobalRules` | Both port and namedPort set | `spec.globalRules[N]: port and namedPort are mutually exclusive` |
+| W-8 | `validateCIDRRules` | Malformed CIDR string | `spec.cidrRules[N]: invalid CIDR "…": …` |
+| W-9 | `validateCIDRRules` | Malformed except CIDR | `spec.cidrRules[N].except[M]: invalid CIDR "…": …` |
+| W-10 | `validateCIDRRules` | Invalid direction value | `spec.cidrRules[N]: direction must be 'ingress' or 'egress'` |
+
+<Accordion title="W-1 / W-2 — Mode and duration validation">
+**Function:** `validateMode`
+
+The webhook mirrors the CEL-1 check but also validates that `spec.mode` itself is a known enum value (the CRD schema already enforces this, but the webhook adds a human-readable error for unknown values that bypass the schema via older API versions).
+
+```go
+// From api/v1/networkpolicygenerator_webhook.go
+func validateMode(spec *NetworkPolicyGeneratorSpec) error {
+    if spec.Mode != modeLearning && spec.Mode != modeEnforcing {
+        return fmt.Errorf("spec.mode must be 'learning' or 'enforcing', got %q", spec.Mode)
+    }
+    if spec.Mode == modeLearning && spec.Duration.Duration <= 0 {
+        return fmt.Errorf("spec.duration is required and must be positive when mode is 'learning'")
+    }
+    return nil
+}
+```
+
+**Fix:** Set `spec.mode` to `learning` or `enforcing`, and ensure `spec.duration` is a positive Go duration when using learning mode.
+</Accordion>
+
+<Accordion title="W-3 — Policy type enum validation">
+**Function:** `validatePolicyType`
+
+Rejects any `spec.policy.type` that is not `"allow"` or `"deny"`.
+
+**Error:**
+```text
+spec.policy.type must be 'allow' or 'deny', got "permit"
+```
+
+**Fix:** Correct the typo in `spec.policy.type`:
+```yaml
+spec:
+  policy:
+    type: allow    # ✅ lowercase 'allow' or 'deny'
+```
+</Accordion>
+
+<Accordion title="W-4 — Policy engine enum validation">
+**Function:** `validatePolicyEngine`
+
+Rejects any `spec.policyEngine` value other than `"kubernetes"`, `"cilium"`, or `"calico"`. An empty string is permitted (treated as the default `kubernetes` engine).
+
+**Error:**
+```text
+spec.policyEngine must be 'kubernetes', 'cilium', or 'calico', got "istio"
+```
+
+**Fix:** Use one of the three supported engine values or omit the field to use the default.
+</Accordion>
+
+<Accordion title="W-5 — Namespace overlap check">
+**Function:** `validateNamespaceOverlap`
+
+Only runs when `spec.policy.type == "deny"`. Builds a set of `deniedNamespaces` and checks that no entry in `allowedNamespaces` appears in it.
+
+**Error:**
+```text
+namespace "monitoring" cannot be both allowed and denied
+```
+
+**Fix:** Remove the conflicting namespace from one of the two lists.
+</Accordion>
+
+<Accordion title="W-6 / W-7 — globalRules port XOR namedPort">
+**Function:** `validateGlobalRules`
+
+Iterates all entries in `spec.globalRules` and verifies that exactly one of `port` or `namedPort` is non-zero/non-empty.
+
+**Errors:**
+```text
+spec.globalRules[2]: either port or namedPort must be specified
+spec.globalRules[1]: port and namedPort are mutually exclusive
+```
+
+**Fix:** Provide exactly one of the two fields per rule entry (see CEL-3 examples above).
+</Accordion>
+
+<Accordion title="W-8 / W-9 — CIDR format validation">
+**Function:** `validateCIDRRules`
+
+Uses Go's `net.ParseCIDR` to validate both `spec.cidrRules[*].cidr` and every entry in `spec.cidrRules[*].except`. This is a check that CEL cannot perform within the apiserver cost budget, which is why it lives in the webhook.
+
+**Error:**
+```text
+spec.cidrRules[0]: invalid CIDR "10.0.0/8": invalid CIDR address: 10.0.0/8
+spec.cidrRules[0].except[1]: invalid CIDR "not-a-cidr": invalid CIDR address: not-a-cidr
+```
+
+**Fix:** Use correct CIDR notation with both a valid IP address and a prefix length:
+```yaml
+cidrRules:
+  - cidr: "10.0.0.0/8"      # ✅ correct — note the host octet is .0.0
+    except:
+      - "10.0.128.0/17"     # ✅ valid sub-range
+    direction: egress
+```
+</Accordion>
+
+<Accordion title="W-10 — CIDR direction validation">
+**Function:** `validateCIDRRules`
+
+Each `spec.cidrRules[*].direction` must be `"ingress"` or `"egress"`. The CRD schema enforces this too, but the webhook produces a clearer diagnostic message.
+
+**Error:**
+```text
+spec.cidrRules[1]: direction must be 'ingress' or 'egress'
+```
+
+**Fix:** Set direction to `ingress` or `egress` (lowercase):
+```yaml
+cidrRules:
+  - cidr: "10.0.0.0/8"
+    direction: egress    # ✅ lowercase
+```
+</Accordion>
+
+---
+
+## Webhook Warnings (Non-Fatal)
+
+After all validation rules pass, the webhook may still emit **admission warnings** — these are non-fatal advisories displayed by `kubectl` but do not block the operation.
+
+| Warning | Condition |
+|---------|-----------|
+| `spec.policy.type is 'deny' but no allowedNamespaces specified` | A deny policy with no allow-list effectively blocks all namespace traffic |
+| `spec.policy.type is 'allow' but no deniedNamespaces specified` | An allow policy with no deny-list has no effect |
+| `dry-run mode is enabled: policies will not be applied to the cluster` | Reminder that `spec.dryRun: true` is active |
+
+```bash
+# Example kubectl output when a warning fires
+Warning: spec.policy.type is 'deny' but no allowedNamespaces specified
+networkpolicygenerator.security.policy.io/my-generator created
+```
+
+---
+
+## Port Range Validation
+
+Port number validation for `spec.globalRules[*].port` is enforced at the OpenAPI schema level via kubebuilder markers:
+
+```yaml
+# From CRD schema
+port:
+  format: int32
+  maximum: 65535
+  minimum: 1
+  type: integer
+```
+
+Any port value outside `1–65535` will be rejected by the API server before any CEL or webhook logic runs.
+
+---
+
+## Protocol Validation
+
+The `spec.globalRules[*].protocol` field is validated as an enum at the OpenAPI schema level:
+
+```yaml
+protocol:
+  enum:
+  - TCP
+  - UDP
+  type: string
+```
+
+The `internal/policy/validator.go` additionally validates protocol values on generated `NetworkPolicy` objects. It accepts `TCP`, `UDP`, and `SCTP` (SCTP is valid at the Kubernetes NetworkPolicy level but not exposed as a CRD enum for `globalRules`).

@@ -1,0 +1,245 @@
+---
+title: "Generating Cilium NetworkPolicies with the Operator"
+sidebarTitle: "Cilium Policies"
+description: "Complete guide for generating CiliumNetworkPolicy resources using the cilium engine, including allow/deny modes, endpoint selectors, and DNS egress rules."
+---
+
+When `spec.policyEngine` is set to `cilium`, Network Policy Generator emits `CiliumNetworkPolicy` resources (`cilium.io/v2`) instead of standard Kubernetes NetworkPolicy objects. CiliumNetworkPolicy offers L3–L7 visibility, identity-based access control through Cilium's endpoint model, and first-class support for `ingressDeny`/`egressDeny` semantics — making it a natural fit for clusters already running Cilium as their CNI. The operator handles all `CiliumEndpointSelector` construction, namespace-to-label mapping, and automatic DNS egress rules on your behalf.
+
+<Warning>
+  **Cilium CNI must be installed and running in your cluster before applying a `NetworkPolicyGenerator` with `policyEngine: cilium`.** If the `cilium.io/v2` CRD is absent, the operator will fail to persist generated resources and will emit an `ApplyFailed` event. Install Cilium via its Helm chart or follow the [official installation guide](https://docs.cilium.io/en/stable/gettingstarted/) before proceeding.
+</Warning>
+
+---
+
+## How the Cilium Engine Maps Spec Fields
+
+The Cilium engine translates `NetworkPolicyGenerator` spec fields into `CiliumNetworkPolicy` structure as follows:
+
+| Generator spec field | CiliumNetworkPolicy field |
+|---|---|
+| `spec.policy.podSelector` | `spec.endpointSelector.matchLabels` |
+| `spec.policy.deniedNamespaces` (allow type) | `spec.ingressDeny[].fromEndpoints` + `spec.egressDeny[].toEndpoints` |
+| `spec.policy.allowedNamespaces` (deny type) | `spec.ingress[].fromEndpoints` + `spec.egress[].toEndpoints` |
+| `spec.globalRules[].direction: ingress` | `spec.ingress[].fromEntities: ["world"]` + `toPorts` |
+| `spec.globalRules[].direction: egress` | `spec.egress[].toEntities: ["world"]` + `toPorts` |
+| `spec.cidrRules[].direction: ingress` | `spec.ingress[].fromCIDR` |
+| `spec.cidrRules[].direction: egress` | `spec.egress[].toCIDR` |
+
+Namespace selectors use the Cilium pod-namespace label key `k8s:io.kubernetes.pod.namespace` rather than the standard `kubernetes.io/metadata.name` key used by the Kubernetes engine.
+
+---
+
+## Allow-Based CiliumNetworkPolicy
+
+An **allow** policy type (`spec.policy.type: allow`) generates `ingressDeny` and `egressDeny` entries targeting the listed `deniedNamespaces`. The operator creates one `CiliumNetworkPolicy` per denied namespace and places it in that namespace.
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: test-cilium-allow
+  labels:
+    app.kubernetes.io/name: network-policy-generator
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  mode: "enforcing"
+  policyEngine: "cilium"
+
+  policy:
+    type: "allow"
+    deniedNamespaces:          # traffic to/from these namespaces is blocked
+      - "test-ns1"
+      - "test-ns2"
+
+  globalRules:
+    - type: "allow"
+      port: 80
+      protocol: TCP
+      direction: "ingress"
+    - type: "allow"
+      port: 443
+      protocol: TCP
+      direction: "egress"
+```
+
+The operator builds `CiliumEndpointSelector` entries for each denied namespace using:
+
+```yaml
+matchLabels:
+  k8s:io.kubernetes.pod.namespace: test-ns1
+```
+
+These selectors populate both `spec.ingressDeny[].fromEndpoints` and `spec.egressDeny[].toEndpoints`, so pods in `test-ns1` and `test-ns2` are denied in both directions. Global rules then add `fromEntities: ["world"]` ingress on port 80 and `toEntities: ["world"]` egress on port 443.
+
+---
+
+## Deny-Based CiliumNetworkPolicy
+
+A **deny** policy type (`spec.policy.type: deny`) generates `ingress` and `egress` allow rules targeting only the listed `allowedNamespaces`. Everything else is implicitly dropped by Cilium's default-deny behaviour when a CiliumNetworkPolicy is present. The operator creates a single `CiliumNetworkPolicy` in the generator's own namespace.
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: test-cilium-deny
+  labels:
+    app.kubernetes.io/name: network-policy-generator
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  mode: "enforcing"
+  policyEngine: "cilium"
+
+  policy:
+    type: "deny"
+    allowedNamespaces:         # only traffic from this namespace is permitted
+      - "test-ns3"
+
+  globalRules:
+    - type: "allow"
+      port: 80
+      protocol: TCP
+      direction: "ingress"
+    - type: "allow"
+      port: 443
+      protocol: TCP
+      direction: "egress"
+```
+
+The resulting `CiliumNetworkPolicy` will carry:
+
+```yaml
+spec:
+  endpointSelector: {}          # applies to all pods (no podSelector set)
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: test-ns3
+    - fromEntities: ["world"]   # global rule: TCP/80 ingress
+      toPorts:
+        - ports:
+            - port: "80"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: test-ns3
+    - toEntities: ["world"]     # global rule: TCP/443 egress
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+    - toEndpoints:              # automatic DNS egress rule
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+```
+
+---
+
+## Automatic DNS Egress Rule
+
+The Cilium engine automatically appends a DNS egress rule to every generated `CiliumNetworkPolicy`. This rule allows pods to reach `kube-dns` in `kube-system` on UDP/53 and TCP/53 regardless of what other egress rules are configured:
+
+```yaml
+# Automatically injected — no configuration required
+egress:
+  - toEndpoints:
+      - matchLabels:
+          k8s:io.kubernetes.pod.namespace: kube-system
+          k8s:k8s-app: kube-dns
+    toPorts:
+      - ports:
+          - port: "53"
+            protocol: UDP
+          - port: "53"
+            protocol: TCP
+```
+
+<Note>
+  Unlike the Kubernetes engine which uses an `IPBlock` to allow DNS, the Cilium engine targets the `kube-dns` endpoints by identity labels. This approach is more robust in multi-network environments because it does not require knowledge of the DNS server's IP address.
+</Note>
+
+---
+
+## Named Ports and CIDR Rules
+
+Both named ports (`spec.globalRules[].namedPort`) and CIDR rules (`spec.cidrRules`) are fully supported by the Cilium engine:
+
+<Tabs>
+  <Tab title="Named ports">
+    Set `namedPort` in a global rule to reference a port by its service name rather than number. The Cilium engine passes the string directly to `CiliumPort.port`:
+
+    ```yaml
+    globalRules:
+      - type: "allow"
+        namedPort: "https"
+        protocol: TCP
+        direction: "egress"
+    ```
+  </Tab>
+
+  <Tab title="CIDR rules">
+    Use `cidrRules` for external IP ranges. The Cilium engine maps them to `fromCIDR` (ingress) or `toCIDR` (egress) in the generated policy:
+
+    ```yaml
+    cidrRules:
+      - cidr: "10.0.0.0/8"
+        direction: "egress"
+      - cidr: "192.168.1.0/24"
+        direction: "ingress"
+    ```
+
+    <Note>
+      The Cilium engine does not map the `except` field from `CIDRRule` to Cilium's `fromCIDRSet`/`toCIDRSet` — CIDR exclusions are supported only by the Kubernetes engine. If you need CIDR exclusions with Cilium, add them manually as separate `CiliumNetworkPolicy` objects.
+    </Note>
+  </Tab>
+</Tabs>
+
+---
+
+## Verifying Generated Policies
+
+After applying a `NetworkPolicyGenerator` with `policyEngine: cilium`, verify the output with:
+
+```bash
+# List all CiliumNetworkPolicies across all namespaces
+kubectl get ciliumnetworkpolicy -A
+
+# Inspect the generated policy in detail
+kubectl get ciliumnetworkpolicy test-cilium-allow-generated \
+  -n test-ns1 -o yaml
+
+# Check generator status (phase, appliedPoliciesCount, policyDiff)
+kubectl get networkpolicygenerator test-cilium-allow \
+  -o jsonpath='{.status}' | jq .
+
+# View reconciliation events
+kubectl describe networkpolicygenerator test-cilium-allow
+```
+
+<Tip>
+  If the `ciliumnetworkpolicy` resource is not found, confirm that the Cilium CRDs are installed: `kubectl get crd | grep cilium.io`. If absent, install or upgrade Cilium before re-applying the generator.
+</Tip>
+
+---
+
+## Switching Between Engines
+
+You can change the `policyEngine` on an existing generator at any time. The operator will generate policies using the new engine on the next reconcile. However, **the old engine's policies are not automatically removed** — you must delete them manually:
+
+```bash
+# Before switching from kubernetes to cilium, remove old NetworkPolicies
+kubectl delete networkpolicy test-cilium-allow-generated -n test-ns1
+
+# Then patch the generator
+kubectl patch networkpolicygenerator test-cilium-allow \
+  --type=merge \
+  -p '{"spec":{"policyEngine":"cilium"}}'
+```

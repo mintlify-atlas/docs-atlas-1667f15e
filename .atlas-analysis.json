@@ -1,0 +1,124 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "Network Policy Generator",
+  "projectDescription": "A Kubernetes operator that automatically generates and manages NetworkPolicies from observed traffic patterns, supporting learning/enforcing modes and multiple CNI backends (Kubernetes, Cilium, Calico).",
+  "theme": "aspen",
+  "primaryColor": "#40993e",
+  "lightColor": "#183018",
+  "darkColor": "#e4e8e4",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/how-it-works",
+              "concepts/operating-modes",
+              "concepts/policy-engines"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/custom-resource",
+              "configuration/policy-rules",
+              "configuration/templates",
+              "configuration/helm-values"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/kubernetes-policies",
+              "guides/cilium-policies",
+              "guides/calico-policies",
+              "guides/advanced-features",
+              "guides/monitoring"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/testing",
+              "operations/troubleshooting",
+              "operations/contributing"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "API Reference",
+            "pages": [
+              "reference/api-spec",
+              "reference/crd-validation",
+              "reference/status-fields"
+            ]
+          },
+          {
+            "group": "CLI & Metrics",
+            "pages": [
+              "reference/operator-flags",
+              "reference/prometheus-metrics"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Learning mode: observes live cluster traffic to discover namespace and rule suggestions before enforcing",
+    "Enforcing mode: automatically applies generated NetworkPolicies based on learned patterns or predefined rules",
+    "Multi-CNI support: generates native policies for Kubernetes NetworkPolicy, Cilium CiliumNetworkPolicy, and Calico NetworkPolicy",
+    "Pod label selector: target specific pods within a namespace rather than the entire namespace",
+    "CIDR-based rules: define ingress/egress rules for external IP ranges with optional exception ranges",
+    "Named port support: reference ports by service name (http, grpc, https) rather than numeric port numbers",
+    "Dry run mode: preview generated policies in status without applying them to the cluster",
+    "Policy diff/audit: track policy Created/Updated changes in status for audit trails",
+    "Built-in policy templates: zero-trust, web-app, backend-api, database, monitoring",
+    "Prometheus metrics: reconcile count, duration, active generators, policy operations",
+    "Schema validation via CEL rules in the CRD itself — no extra admission controller required",
+    "Optional admission webhook for additional CIDR and cross-field validation"
+  ],
+  "publicApiSurface": [
+    "CRD: NetworkPolicyGenerator (security.policy.io/v1)",
+    "spec.mode: learning | enforcing",
+    "spec.duration: learning duration (required when mode=learning)",
+    "spec.policyEngine: kubernetes | cilium | calico",
+    "spec.templateName: zero-trust | web-app | backend-api | database | monitoring",
+    "spec.dryRun: bool — preview policies without applying",
+    "spec.policy.type: allow | deny",
+    "spec.policy.allowedNamespaces: list of allowed source namespaces",
+    "spec.policy.deniedNamespaces: list of denied source namespaces",
+    "spec.policy.podSelector: label map to restrict target pods",
+    "spec.globalRules[]: port/namedPort rules with protocol and direction",
+    "spec.cidrRules[]: CIDR-based rules with optional except[] ranges",
+    "status.phase: current lifecycle phase",
+    "status.lastAnalyzed: timestamp of last traffic analysis",
+    "status.observedTraffic: collected traffic flows from learning mode",
+    "status.suggestedNamespaces: namespace suggestions from learning mode",
+    "status.suggestedRules: traffic-derived rule suggestions",
+    "status.generatedPolicies: serialized policy JSON (used in dry-run mode)",
+    "status.policyDiff: Created/Updated audit entries",
+    "status.appliedPoliciesCount: number of currently active policies",
+    "Operator flag: --enable-webhooks (enables admission webhook, requires cert-manager)",
+    "Operator flag: --leader-elect (enables leader election)",
+    "Operator flag: --metrics-bind-address (default :8443)",
+    "Operator flag: --health-probe-bind-address (default :8081)",
+    "Prometheus metrics: npg_reconcile_total, npg_policies_applied, npg_policy_operations_total, npg_generators_active, npg_reconcile_duration_seconds, npg_dry_run_total, npg_validation_errors_total",
+    "Helm chart: oci://ghcr.io/somaz94/charts/network-policy-generator",
+    "Container image: somaz940/network-policy-generator:v0.4.0"
+  ]
+}

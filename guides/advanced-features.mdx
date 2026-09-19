@@ -1,0 +1,334 @@
+---
+title: "Advanced Features of Network Policy Generator"
+sidebarTitle: "Advanced Features"
+description: "Deep dive into pod selectors, CIDR rules, named ports, dry-run mode, policy diff auditing, and Kubernetes event recording for Network Policy Generator."
+---
+
+Network Policy Generator exposes a rich set of cross-cutting capabilities that work across all three policy engines (`kubernetes`, `cilium`, `calico`). This guide covers the advanced spec fields and status features that let you refine policy scope, safely preview changes before they go live, and audit every mutation the operator makes to your cluster. Each section below maps directly to a field in the `NetworkPolicyGeneratorSpec` or `NetworkPolicyGeneratorStatus` types — no guesswork required.
+
+---
+
+## Feature Reference
+
+<Accordion title="Pod Label Selector — target specific pods in a namespace">
+  By default a generated NetworkPolicy applies to **all pods** in the target namespace because its `podSelector` is empty. Set `spec.policy.podSelector` to restrict the policy to a specific subset of pods identified by label key-value pairs.
+
+  **When to use:** your namespace hosts multiple services with different trust levels and you want per-workload policies without one policy interfering with another.
+
+  ```yaml
+  apiVersion: security.policy.io/v1
+  kind: NetworkPolicyGenerator
+  metadata:
+    name: pod-selector-example
+    labels:
+      app.kubernetes.io/name: network-policy-generator
+      app.kubernetes.io/managed-by: kustomize
+  spec:
+    mode: "enforcing"
+
+    policy:
+      type: "deny"
+      allowedNamespaces:
+        - "monitoring"
+        - "logging"
+      podSelector:              # only pods with BOTH labels are targeted
+        app: "web"
+        tier: "frontend"
+
+    globalRules:
+      - type: "allow"
+        port: 80
+        protocol: TCP
+        direction: "ingress"
+      - type: "allow"
+        port: 443
+        protocol: TCP
+        direction: "egress"
+  ```
+
+  **Engine behaviour:**
+  - **Kubernetes engine** — map is placed in `spec.podSelector.matchLabels` of the NetworkPolicy.
+  - **Cilium engine** — map is placed in `spec.endpointSelector.matchLabels` of the CiliumNetworkPolicy.
+  - **Calico engine** — map is converted to a selector expression string (e.g., `app == 'web' && tier == 'frontend'`) placed in `spec.selector` of the Calico NetworkPolicy.
+
+  Pods that do not carry all listed labels are unaffected by the generated policy.
+</Accordion>
+
+<Accordion title="CIDR Rules — allow external IP ranges">
+  `spec.cidrRules` lets you express ingress or egress rules based on external IP ranges rather than namespace identity. This is essential for traffic that originates from or goes to resources outside the cluster — on-premise servers, external APIs, or monitoring collectors.
+
+  Each entry in `cidrRules` specifies a `cidr` string, an optional list of `except` CIDRs to exclude, and a `direction` (`ingress` or `egress`).
+
+  ```yaml
+  apiVersion: security.policy.io/v1
+  kind: NetworkPolicyGenerator
+  metadata:
+    name: cidr-rules-example
+    labels:
+      app.kubernetes.io/name: network-policy-generator
+      app.kubernetes.io/managed-by: kustomize
+  spec:
+    mode: "enforcing"
+
+    policy:
+      type: "deny"
+      allowedNamespaces:
+        - "kube-system"
+
+    cidrRules:
+      - cidr: "10.0.0.0/8"         # allow egress to internal network
+        direction: "egress"
+      - cidr: "192.168.1.0/24"     # allow ingress from specific subnet
+        except:
+          - "192.168.1.200/32"     # except this IP
+        direction: "ingress"
+      - cidr: "203.0.113.0/24"     # allow egress to external API server
+        direction: "egress"
+
+    globalRules:
+      - type: "allow"
+        port: 443
+        protocol: TCP
+        direction: "egress"
+  ```
+
+  **Engine mapping:**
+  - **Kubernetes** — `except` is mapped to `spec.egress[].to[].ipBlock.except` / `spec.ingress[].from[].ipBlock.except`.
+  - **Cilium** — `fromCIDR` / `toCIDR` fields are populated; `except` is not carried over to Cilium's `CIDRSet` automatically.
+  - **Calico** — `nets` and `notNets` fields on `CalicoEntityRule` are populated.
+
+  <Warning>
+    The `except` list is honoured by the Kubernetes and Calico engines. When using the Cilium engine, CIDR exclusions must be managed with separate `CiliumNetworkPolicy` resources or Cilium's `toCIDRSet` syntax.
+  </Warning>
+</Accordion>
+
+<Accordion title="Named Ports — reference ports by service name">
+  Instead of specifying numeric port numbers in `globalRules`, you can reference a port by the name defined in your `Service` or `Pod` spec using `namedPort`. Exactly one of `port` or `namedPort` must be set per rule — the CRD validation webhook enforces this.
+
+  **When to use:** your services use named ports in their specs (e.g., `containerPort: 8080, name: http`) and you want policies to follow the service contract rather than a hardcoded number.
+
+  ```yaml
+  apiVersion: security.policy.io/v1
+  kind: NetworkPolicyGenerator
+  metadata:
+    name: named-port-example
+    labels:
+      app.kubernetes.io/name: network-policy-generator
+      app.kubernetes.io/managed-by: kustomize
+  spec:
+    mode: "enforcing"
+
+    policy:
+      type: "deny"
+      allowedNamespaces:
+        - "kube-system"
+      podSelector:
+        app: "api-server"
+
+    globalRules:
+      - type: "allow"
+        namedPort: "http"         # named port — no numeric value required
+        protocol: TCP
+        direction: "ingress"
+      - type: "allow"
+        namedPort: "grpc"
+        protocol: TCP
+        direction: "ingress"
+      - type: "allow"
+        namedPort: "https"
+        protocol: TCP
+        direction: "egress"
+  ```
+
+  **Engine behaviour:**
+  - **Kubernetes** — the port name is passed to `intstr.FromString()` and placed in `NetworkPolicyPort.Port` as a string value.
+  - **Cilium** — the port name is used directly as `CiliumPort.Port`.
+  - **Calico** — the port name is placed in `CalicoEntityRule.Ports` as a string value.
+</Accordion>
+
+<Accordion title="Dry Run Mode — preview policies without applying them">
+  Set `spec.dryRun: true` to have the operator generate policies in full but **skip the API server apply step**. The serialized JSON of every policy object is written to `status.generatedPolicies` instead. No NetworkPolicy, CiliumNetworkPolicy, or Calico NetworkPolicy resources are created or modified in the cluster.
+
+  This is the safest way to audit what the operator *would* do before committing to a live enforcement change.
+
+  ```yaml
+  apiVersion: security.policy.io/v1
+  kind: NetworkPolicyGenerator
+  metadata:
+    name: dry-run-example
+    labels:
+      app.kubernetes.io/name: network-policy-generator
+      app.kubernetes.io/managed-by: kustomize
+  spec:
+    mode: "enforcing"
+    dryRun: true                # generate but do not apply
+
+    policy:
+      type: "deny"
+      allowedNamespaces:
+        - "monitoring"
+        - "logging"
+      podSelector:
+        app: "backend"
+
+    globalRules:
+      - type: "allow"
+        port: 8080
+        protocol: TCP
+        direction: "ingress"
+      - type: "allow"
+        namedPort: "https"
+        protocol: TCP
+        direction: "egress"
+
+    cidrRules:
+      - cidr: "10.0.0.0/8"
+        direction: "egress"
+  ```
+
+  Inspect the generated policy JSON with:
+
+  ```bash
+  # Raw JSON array of generated policy objects
+  kubectl get networkpolicygenerator dry-run-example \
+    -o jsonpath='{.status.generatedPolicies}'
+
+  # Pretty-print each policy
+  kubectl get networkpolicygenerator dry-run-example \
+    -o jsonpath='{.status.generatedPolicies[0]}' | jq .
+  ```
+
+  When dry-run mode is active:
+  - `status.appliedPoliciesCount` is set to `0`.
+  - `status.policyDiff` is cleared (`null`).
+  - A `DryRun` Kubernetes Event is recorded: *"Dry-run mode: generated N engine policies without applying"*.
+  - The `npg_dry_run_total` Prometheus counter is incremented.
+
+  <Tip>
+    Toggle dry-run off to commit the policies: `kubectl patch networkpolicygenerator dry-run-example --type=merge -p '{"spec":{"dryRun":false}}'`. The operator will apply all policies on the next reconcile.
+  </Tip>
+</Accordion>
+
+<Accordion title="Policy Diff and Audit — track every change">
+  After each successful enforcing reconcile, the operator populates `status.policyDiff` with a slice of `PolicyDiffEntry` objects — one per policy that was created or updated. Each entry records the policy name, namespace, action (`Created` or `Updated`), and the timestamp of the change.
+
+  ```bash
+  # View the full policy diff for the last reconcile
+  kubectl get networkpolicygenerator full-features-example \
+    -o jsonpath='{.status.policyDiff}' | jq .
+  ```
+
+  Example output:
+
+  ```json
+  [
+    {
+      "policyName": "full-features-example-generated",
+      "namespace": "default",
+      "action": "Created",
+      "timestamp": "2024-11-15T10:32:45Z"
+    }
+  ]
+  ```
+
+  You can also inspect `status.appliedPoliciesCount` to see how many policy objects are currently managed by this generator:
+
+  ```bash
+  kubectl get networkpolicygenerator full-features-example \
+    -o jsonpath='{.status.appliedPoliciesCount}'
+  ```
+
+  The diff is **reset on every reconcile** — it reflects only the most recent reconciliation cycle, not a cumulative history. For long-term audit history, forward Kubernetes Events to an external log aggregator (see the Events section below).
+</Accordion>
+
+<Accordion title="Kubernetes Events — reconciliation and error tracking">
+  The operator records Kubernetes Events on the `NetworkPolicyGenerator` object for every significant action taken during reconciliation. Use `kubectl describe` to view the event stream:
+
+  ```bash
+  kubectl describe networkpolicygenerator full-features-example
+  ```
+
+  The `Events` section will include entries such as:
+
+  | Reason | Type | Description |
+  |---|---|---|
+  | `PolicyCreated` | Normal | A new policy was created successfully |
+  | `PolicyUpdated` | Normal | An existing policy was updated |
+  | `DryRun` | Normal | Dry-run mode: N policies generated without applying |
+  | `GenerationFailed` | Warning | Policy generation encountered an error |
+  | `ApplyFailed` | Warning | Policy could not be applied to the API server |
+
+  Events are emitted using `Eventf` so the full engine name, namespace, and policy name appear in each message body, making it easy to correlate events with specific resources.
+
+  **Forward events to an aggregator:**
+
+  ```bash
+  # Watch events for a specific generator in real time
+  kubectl get events --field-selector involvedObject.name=full-features-example \
+    --watch
+  ```
+</Accordion>
+
+---
+
+## Full-Featured Example
+
+The following sample combines pod selector, CIDR rules, named ports, and all other advanced fields in a single generator:
+
+```yaml
+apiVersion: security.policy.io/v1
+kind: NetworkPolicyGenerator
+metadata:
+  name: full-features-example
+  labels:
+    app.kubernetes.io/name: network-policy-generator
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  mode: "enforcing"
+  policyEngine: "kubernetes"
+
+  policy:
+    type: "deny"
+    allowedNamespaces:
+      - "kube-system"
+      - "monitoring"
+      - "istio-system"
+    podSelector:
+      app: "payment-service"
+      tier: "backend"
+
+  globalRules:
+    - type: "allow"
+      port: 8443
+      protocol: TCP
+      direction: "ingress"
+    - type: "allow"
+      namedPort: "metrics"
+      protocol: TCP
+      direction: "ingress"
+    - type: "allow"
+      namedPort: "https"
+      protocol: TCP
+      direction: "egress"
+
+  cidrRules:
+    - cidr: "10.0.0.0/8"
+      direction: "egress"
+    - cidr: "172.16.0.0/12"
+      direction: "egress"
+    - cidr: "203.0.113.0/24"
+      except:
+        - "203.0.113.128/25"
+      direction: "ingress"
+```
+
+After applying, check everything in one command:
+
+```bash
+kubectl get networkpolicygenerator full-features-example -o jsonpath='{.status}' | jq '{
+  phase: .phase,
+  appliedPoliciesCount: .appliedPoliciesCount,
+  policyDiff: .policyDiff,
+  lastAnalyzed: .lastAnalyzed
+}'
+```

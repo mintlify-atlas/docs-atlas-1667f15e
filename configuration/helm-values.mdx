@@ -1,0 +1,330 @@
+---
+title: "Helm Chart Values Reference for Network Policy Generator"
+sidebarTitle: "Helm Values"
+description: "Complete reference for all Helm chart values, including image, RBAC, resources, controller flags, probes, metrics, and CRD lifecycle settings."
+---
+
+The Network Policy Generator Helm chart packages the controller deployment, RBAC resources, CRD installation, and metrics service into a single, configurable unit. Every aspect of the deployment — from the container image to leader election and liveness probe timing — is exposed as a Helm value so you can adapt the operator to your cluster's requirements without modifying any manifests directly.
+
+## Installing the chart
+
+<Tabs>
+  <Tab title="OCI registry (recommended)">
+    ```bash
+    helm install npg oci://ghcr.io/somaz94/charts/network-policy-generator \
+      --namespace network-policy-generator-system \
+      --create-namespace
+    ```
+  </Tab>
+  <Tab title="Helm repository">
+    ```bash
+    helm repo add network-policy-generator \
+      https://somaz94.github.io/network-policy-generator/helm-repo
+    helm repo update
+    helm install npg network-policy-generator/network-policy-generator \
+      --namespace network-policy-generator-system \
+      --create-namespace
+    ```
+  </Tab>
+  <Tab title="Local chart">
+    ```bash
+    helm install npg ./helm/network-policy-generator \
+      --namespace network-policy-generator-system \
+      --create-namespace
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## All values at a glance
+
+The table below lists every value, its default, and a brief description. Detailed `<ParamField>` documentation follows for each group.
+
+| Value | Default | Description |
+|---|---|---|
+| `namespace` | `network-policy-generator-system` | Operator namespace |
+| `image.repository` | `somaz940/network-policy-generator` | Container image repository |
+| `image.tag` | `v0.4.0` | Image tag |
+| `image.pullPolicy` | `IfNotPresent` | Image pull policy |
+| `serviceAccount.create` | `true` | Create a dedicated service account |
+| `serviceAccount.name` | `network-policy-generator-controller-manager` | Service account name |
+| `podSecurityContext.runAsNonRoot` | `true` | Run pod as non-root user |
+| `securityContext.allowPrivilegeEscalation` | `false` | Disallow privilege escalation |
+| `securityContext.capabilities.drop` | `["ALL"]` | Drop all Linux capabilities |
+| `resources.limits.cpu` | `500m` | CPU limit |
+| `resources.limits.memory` | `128Mi` | Memory limit |
+| `resources.requests.cpu` | `10m` | CPU request |
+| `resources.requests.memory` | `64Mi` | Memory request |
+| `controller.metricsBindAddress` | `:8443` | Metrics server bind address |
+| `controller.healthProbeBindAddress` | `:8081` | Health probe bind address |
+| `controller.leaderElect` | `true` | Enable leader election |
+| `service.type` | `ClusterIP` | Metrics service type |
+| `service.port` | `8443` | Metrics service port |
+| `probes.liveness.initialDelaySeconds` | `15` | Liveness probe initial delay |
+| `probes.liveness.periodSeconds` | `20` | Liveness probe period |
+| `probes.liveness.port` | `8081` | Liveness probe port |
+| `probes.readiness.initialDelaySeconds` | `5` | Readiness probe initial delay |
+| `probes.readiness.periodSeconds` | `10` | Readiness probe period |
+| `probes.readiness.port` | `8081` | Readiness probe port |
+| `rbac.enabled` | `true` | Create RBAC resources |
+| `crds.enabled` | `true` | Install CRDs with the chart |
+| `crds.cleanup` | `true` | Remove CRDs on `helm uninstall` |
+| `metrics.enabled` | `true` | Deploy the metrics Service |
+| `metrics.port` | `8443` | Metrics port |
+
+---
+
+## Namespace
+
+<ParamField path="namespace" type="string" default="network-policy-generator-system">
+  The Kubernetes namespace where the operator is deployed. All controller resources (Deployment, ServiceAccount, RBAC bindings, Service) are created in this namespace. Custom resources (`NetworkPolicyGenerator`) can be created in any namespace — the operator has cluster-wide RBAC.
+</ParamField>
+
+---
+
+## Image
+
+<ParamField path="image.repository" type="string" default="somaz940/network-policy-generator">
+  Docker image repository for the controller. Override to use a private registry mirror or a custom build.
+
+  ```yaml
+  image:
+    repository: registry.mycompany.com/infra/network-policy-generator
+  ```
+</ParamField>
+
+<ParamField path="image.tag" type="string" default="v0.4.0">
+  Image tag to deploy. Defaults to the chart's bundled version. Pin to a specific tag in production to prevent unexpected updates during `helm upgrade`.
+</ParamField>
+
+<ParamField path="image.pullPolicy" type="string" default="IfNotPresent">
+  Kubernetes image pull policy. One of `IfNotPresent`, `Always`, or `Never`. Use `Always` when pulling from a registry that updates the same tag (e.g., `latest` or a mutable release tag).
+</ParamField>
+
+---
+
+## Service account
+
+<ParamField path="serviceAccount.create" type="boolean" default="true">
+  When `true`, the chart creates a dedicated `ServiceAccount` in the operator namespace. Set to `false` if your organization manages service accounts separately.
+</ParamField>
+
+<ParamField path="serviceAccount.name" type="string" default="network-policy-generator-controller-manager">
+  Name of the service account. Used both when `serviceAccount.create: true` (name assigned to the created account) and when `serviceAccount.create: false` (name of the pre-existing account the Deployment should reference).
+</ParamField>
+
+---
+
+## Security context
+
+<ParamField path="podSecurityContext.runAsNonRoot" type="boolean" default="true">
+  Instructs Kubernetes to reject the pod if the container process would run as UID 0. The controller image is built to run as a non-root user, so this should remain `true` in all environments.
+</ParamField>
+
+<ParamField path="securityContext.allowPrivilegeEscalation" type="boolean" default="false">
+  Prevents the container process from gaining additional privileges beyond its initial set. Should remain `false` — the controller does not require elevated privileges.
+</ParamField>
+
+<ParamField path="securityContext.capabilities.drop" type="string[]" default='["ALL"]'>
+  List of Linux capabilities to drop from the container. Defaults to dropping all capabilities, giving the controller the minimum viable privilege set required by the container runtime.
+</ParamField>
+
+---
+
+## Resources
+
+<ParamField path="resources.limits.cpu" type="string" default="500m">
+  Maximum CPU the controller container may use. Increase for clusters with a very high rate of `NetworkPolicyGenerator` reconciliations or large numbers of CRs.
+</ParamField>
+
+<ParamField path="resources.limits.memory" type="string" default="128Mi">
+  Maximum memory the controller container may use. The controller holds generated policy state in memory during reconciliation; increase to `256Mi` or more if you observe OOMKilled events.
+</ParamField>
+
+<ParamField path="resources.requests.cpu" type="string" default="10m">
+  CPU reserved for the controller pod. Used by the scheduler to select a node. Keep low — the controller is mostly idle between reconcile loops.
+</ParamField>
+
+<ParamField path="resources.requests.memory" type="string" default="64Mi">
+  Memory reserved for the controller pod.
+</ParamField>
+
+---
+
+## Controller flags
+
+<ParamField path="controller.metricsBindAddress" type="string" default=":8443">
+  Address and port the controller's metrics server listens on. The colon prefix means it binds to all interfaces on the given port. Must match `metrics.port` and `service.port` if you change it.
+</ParamField>
+
+<ParamField path="controller.healthProbeBindAddress" type="string" default=":8081">
+  Address and port for the health probe HTTP server (`/healthz` for liveness, `/readyz` for readiness). Must match `probes.liveness.port` and `probes.readiness.port`.
+</ParamField>
+
+<ParamField path="controller.leaderElect" type="boolean" default="true">
+  Enables Kubernetes leader election so that only one controller replica is active at a time when running multiple replicas. Disable only in single-replica development deployments where the leader election overhead is undesirable.
+
+  <Warning>
+  Disabling leader election with more than one replica will cause multiple controllers to reconcile the same resources simultaneously, leading to conflicts and redundant policy churn.
+  </Warning>
+</ParamField>
+
+---
+
+## Service
+
+<ParamField path="service.type" type="string" default="ClusterIP">
+  Kubernetes Service type for the metrics endpoint. `ClusterIP` exposes the metrics server only within the cluster (suitable for Prometheus scraping). Use `NodePort` or `LoadBalancer` only if your metrics scraper is external to the cluster.
+</ParamField>
+
+<ParamField path="service.port" type="integer" default="8443">
+  Service port exposed for metrics. Proxied to `controller.metricsBindAddress` inside the pod. Must match `metrics.port`.
+</ParamField>
+
+---
+
+## Probes
+
+<ParamField path="probes.liveness.initialDelaySeconds" type="integer" default="15">
+  Seconds to wait after container start before the first liveness check. The controller needs a few seconds to establish its manager and leader election lease.
+</ParamField>
+
+<ParamField path="probes.liveness.periodSeconds" type="integer" default="20">
+  Frequency (in seconds) of liveness checks. Kubelet kills and restarts the container if this check fails.
+</ParamField>
+
+<ParamField path="probes.liveness.port" type="integer" default="8081">
+  Port on which the liveness HTTP probe hits `/healthz`. Must match `controller.healthProbeBindAddress`.
+</ParamField>
+
+<ParamField path="probes.readiness.initialDelaySeconds" type="integer" default="5">
+  Seconds to wait after container start before the first readiness check. Lower than the liveness delay because the readiness endpoint becomes available before the full reconcile loop is active.
+</ParamField>
+
+<ParamField path="probes.readiness.periodSeconds" type="integer" default="10">
+  Frequency of readiness checks. The pod is removed from Service endpoints while this check fails.
+</ParamField>
+
+<ParamField path="probes.readiness.port" type="integer" default="8081">
+  Port on which the readiness HTTP probe hits `/readyz`.
+</ParamField>
+
+---
+
+## RBAC
+
+<ParamField path="rbac.enabled" type="boolean" default="true">
+  When `true`, the chart creates all necessary `ClusterRole`, `ClusterRoleBinding`, `Role`, and `RoleBinding` resources for the controller to manage `NetworkPolicy`, `CiliumNetworkPolicy`, and Calico `NetworkPolicy` resources across all namespaces. Disable only if your organization manages RBAC separately.
+</ParamField>
+
+---
+
+## CRDs
+
+<ParamField path="crds.enabled" type="boolean" default="true">
+  When `true`, the `NetworkPolicyGenerator` CRD is installed as part of `helm install`. Set to `false` if you manage CRD lifecycle separately (e.g., via GitOps or a platform team).
+
+  <Note>
+  The CRD includes CEL validation rules that require Kubernetes v1.25+. Installing on an older cluster will fail.
+  </Note>
+</ParamField>
+
+<ParamField path="crds.cleanup" type="boolean" default="true">
+  When `true`, running `helm uninstall` removes the CRD from the cluster, which also deletes all `NetworkPolicyGenerator` custom resources and the policies they manage. Set to `false` if you want to preserve CRs and policies across operator re-installs or version migrations.
+
+  <Warning>
+  With `crds.cleanup: true`, `helm uninstall` is destructive — all `NetworkPolicyGenerator` objects and their generated policies are permanently deleted. Always set `crds.cleanup: false` in production unless you intend a full teardown.
+  </Warning>
+</ParamField>
+
+---
+
+## Metrics
+
+<ParamField path="metrics.enabled" type="boolean" default="true">
+  Deploys a Kubernetes Service that exposes the controller metrics endpoint. Disable if you scrape the pod directly via PodMonitor or do not use Prometheus.
+</ParamField>
+
+<ParamField path="metrics.port" type="integer" default="8443">
+  Port number for the metrics Service. Must match `controller.metricsBindAddress` and `service.port`.
+</ParamField>
+
+---
+
+## Common override examples
+
+### Production deployment with increased resources
+
+```bash
+helm install npg oci://ghcr.io/somaz94/charts/network-policy-generator \
+  --namespace network-policy-generator-system \
+  --create-namespace \
+  --set image.tag=v0.4.0 \
+  --set resources.limits.cpu=1000m \
+  --set resources.limits.memory=256Mi \
+  --set resources.requests.cpu=100m \
+  --set resources.requests.memory=128Mi \
+  --set controller.leaderElect=true \
+  --set crds.cleanup=false
+```
+
+### Custom values file
+
+Create `custom-values.yaml`:
+
+```yaml
+namespace: platform-operators
+
+image:
+  repository: registry.mycompany.com/infra/network-policy-generator
+  tag: v0.4.0
+  pullPolicy: Always
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+controller:
+  leaderElect: true
+
+crds:
+  enabled: true
+  cleanup: false   # preserve CRs and policies on uninstall
+
+metrics:
+  enabled: true
+  port: 8443
+```
+
+Then install:
+
+```bash
+helm install npg oci://ghcr.io/somaz94/charts/network-policy-generator \
+  --namespace platform-operators \
+  --create-namespace \
+  -f custom-values.yaml
+```
+
+### Upgrading
+
+```bash
+helm repo update
+helm upgrade npg oci://ghcr.io/somaz94/charts/network-policy-generator \
+  --namespace network-policy-generator-system \
+  -f custom-values.yaml
+```
+
+### Uninstalling
+
+```bash
+helm uninstall npg --namespace network-policy-generator-system
+```
+
+<Warning>
+If `crds.cleanup` is `true` (the default), the uninstall removes the CRD and **all** `NetworkPolicyGenerator` custom resources and their generated `NetworkPolicy` objects across the entire cluster. Workloads that depended on those policies will lose their network restrictions immediately.
+</Warning>

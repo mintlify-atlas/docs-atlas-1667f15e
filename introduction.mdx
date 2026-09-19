@@ -1,0 +1,108 @@
+---
+title: "Network Policy Generator: Kubernetes Operator Overview"
+sidebarTitle: "Introduction"
+description: "Network Policy Generator is a Kubernetes operator that auto-generates NetworkPolicies from observed traffic patterns using learning and enforcing modes with multi-CNI support."
+---
+
+Network Policy Generator is a Kubernetes operator that eliminates the manual burden of writing and maintaining network segmentation policies. Instead of crafting YAML by hand, you deploy a single `NetworkPolicyGenerator` custom resource and let the operator either observe real traffic in your cluster and surface data-driven recommendations, or immediately generate and enforce policies using rules you define — all backed by your choice of Kubernetes-native, Cilium, or Calico policy engines.
+
+## Why Network Policy Generator?
+
+Writing Kubernetes NetworkPolicies from scratch is error-prone and rarely reflects actual runtime traffic. Teams often either skip policies entirely (accepting a flat network) or craft overly broad rules that fail to contain lateral movement. Network Policy Generator bridges that gap:
+
+- **Data-driven policies** — In `learning` mode the operator watches live traffic flows and records source/destination namespaces, ports, and protocols in `.status.observedTraffic`. After the observation window closes it surfaces `.status.suggestedNamespaces` and `.status.suggestedRules` so your policies reflect what pods actually need to talk to.
+- **Zero-touch enforcement** — Switch to `enforcing` mode and the reconciler generates and applies Kubernetes, Cilium, or Calico NetworkPolicy objects automatically, keeping them in sync as your `NetworkPolicyGenerator` spec evolves.
+- **Gradual rollout path** — Use `dryRun: true` to preview generated policies in `.status.generatedPolicies` before anything touches the live cluster. The built-in policy diff in `.status.policyDiff` provides a full audit trail of every `Created` or `Updated` change.
+- **Zero-trust by default** — Built-in templates like `zero-trust` and `web-app` give you a hardened starting point so every new workload begins with a least-privilege posture.
+
+## Architecture Overview
+
+The operator is built with kubebuilder and controller-runtime v0.25.0. Its entire surface area is a single CRD:
+
+```
+security.policy.io/v1  →  NetworkPolicyGenerator
+```
+
+A `NetworkPolicyGenerator` resource drives the full lifecycle:
+
+1. **Learning phase** — The traffic monitor samples pod-to-pod connections for the configured `duration` and writes observed flows into the resource status.
+2. **Enforcing phase** — The reconciler consults the selected `policyEngine`, merges any active `templateName` with user-defined `globalRules` and `cidrRules`, then creates or updates the resulting NetworkPolicy objects in the same namespace.
+3. **Dry-run preview** — When `dryRun: true`, generated policy JSON is stored in `.status.generatedPolicies` and no live objects are created or mutated.
+
+<CardGroup cols={3}>
+  <Card title="Two Operational Modes" icon="toggle-on">
+    `learning` observes real traffic and surfaces suggestions. `enforcing` generates and applies policies automatically.
+  </Card>
+  <Card title="Three Policy Engines" icon="gear">
+    `kubernetes` (NetworkPolicy), `cilium` (CiliumNetworkPolicy), and `calico` (Calico NetworkPolicy) — switch with one field.
+  </Card>
+  <Card title="Five Built-in Templates" icon="layer-group">
+    `zero-trust`, `web-app`, `backend-api`, `database`, and `monitoring` give you hardened starting points for common workloads.
+  </Card>
+  <Card title="Pod Label Selector" icon="tag">
+    Target individual pods by label rather than blanket-applying policy to an entire namespace.
+  </Card>
+  <Card title="CIDR & Named-Port Rules" icon="network-wired">
+    Define ingress/egress rules for external IP ranges and reference ports by name (`http`, `grpc`) instead of number.
+  </Card>
+  <Card title="Dry Run & Policy Diff" icon="magnifying-glass">
+    Preview generated policies without applying them, and audit every `Created` or `Updated` change in `.status.policyDiff`.
+  </Card>
+  <Card title="CEL Schema Validation" icon="shield-check">
+    Core spec rules (mode/duration consistency, port XOR namedPort, no overlapping namespace lists) are enforced by the CRD itself — no webhook needed.
+  </Card>
+  <Card title="Prometheus Metrics" icon="chart-line">
+    Custom metrics for reconcile count, reconcile duration, active generators, and policy operations are exposed on `:8443`.
+  </Card>
+  <Card title="Kubernetes Event Recording" icon="bell">
+    Events are emitted on policy apply, delete, mode transitions, and errors — visible with `kubectl describe`.
+  </Card>
+</CardGroup>
+
+## Policy Engines at a Glance
+
+| Engine | API Group | Resource Kind | CNI Required |
+|---|---|---|---|
+| `kubernetes` (default) | `networking.k8s.io/v1` | `NetworkPolicy` | Any CNI supporting NetworkPolicy |
+| `cilium` | `cilium.io/v2` | `CiliumNetworkPolicy` | Cilium CNI |
+| `calico` | `crd.projectcalico.org/v1` | `NetworkPolicy` | Calico CNI |
+
+## Built-in Policy Templates
+
+Templates are merged with user-defined `globalRules`; user rules always take precedence over template-provided rules.
+
+| Template | Default Behaviour |
+|---|---|
+| `zero-trust` | Deny all traffic; allow DNS egress only |
+| `web-app` | Allow HTTP/HTTPS ingress; allow DNS and HTTPS egress |
+| `backend-api` | Allow ports 8080, 8443, 9090 ingress; allow HTTPS egress |
+| `database` | Allow DB ports 3306, 5432, 6379, 27017 ingress; DNS-only egress |
+| `monitoring` | Allow Prometheus scraping on 9090/9100; allow HTTPS egress |
+
+## Prerequisites
+
+Before installing Network Policy Generator, ensure your environment meets the following requirements:
+
+| Requirement | Minimum Version | Notes |
+|---|---|---|
+| Kubernetes | v1.25+ | CEL `x-kubernetes-validations` support required for CRD schema validation |
+| kubectl | v1.11.3+ | Used to manage CRDs and `NetworkPolicyGenerator` resources |
+| Helm | 3.8+ | Required for OCI registry install (recommended path) |
+| Cilium CNI | Any supported | Only required when `policyEngine: cilium` |
+| Calico CNI | Any supported | Only required when `policyEngine: calico` |
+| cert-manager | Any supported | Only required when enabling the optional admission webhook |
+
+<Note>
+  The CRD ships with CEL `x-kubernetes-validations` rules that enforce spec correctness at admission time. These rules require Kubernetes v1.25+ and work on every cluster without enabling the optional webhook.
+</Note>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Install the Operator" icon="download" href="/installation">
+    Get up and running with Helm (recommended), `kubectl apply`, or a source build in minutes.
+  </Card>
+  <Card title="Quick Start Guide" icon="rocket" href="/quickstart">
+    Deploy your first `NetworkPolicyGenerator`, flip between learning and enforcing modes, and inspect generated policies.
+  </Card>
+</CardGroup>
